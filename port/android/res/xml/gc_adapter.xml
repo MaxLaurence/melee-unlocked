@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The GameCube adapter (Nintendo WUP-028, 057E:0337): plugging it in offers the game, and choosing it
+     "always" gives the game the adapter from then on without asking. -->
+<resources>
+    <usb-device vendor-id="1406" product-id="823" />
+</resources>
