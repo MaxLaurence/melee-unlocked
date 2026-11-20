@@ -911,6 +911,19 @@ std::array<PortSource, 4> g_port_feeding{};
 std::mutex g_last_pads_mutex;
 PadState g_last_pads[4]{};
 std::atomic<uint16_t> g_test_hold{0};   // input_test_hold (tests only)
+// input_pulse: per port, the buttons and how many more reads carry them (one word: polls << 16 | buttons).
+std::atomic<uint32_t> g_pulse[4] = {};
+void apply_pulse(PadState out[4]) {
+  for (int p = 0; p < 4; ++p) {
+    uint32_t v = g_pulse[p].load(std::memory_order_relaxed);
+    while (v >> 16) {
+      if (g_pulse[p].compare_exchange_weak(v, v - 0x10000u, std::memory_order_relaxed)) {
+        out[p].button |= (uint16_t)(v & 0xFFFFu);
+        break;
+      }
+    }
+  }
+}
 
 namespace {
 bool g_capture_key_baseline[256]{};
@@ -1936,6 +1949,7 @@ void input_poll(PadState out[4]) {
     script_pads(retrace_count(), true, out);
     route_takeover(out);
     if (const uint16_t held = g_test_hold.load(std::memory_order_relaxed)) { out[0].button |= held; out[0].err = 0; }
+    apply_pulse(out);
     // Scripted runs took this return before the overlay's copy was made below, so the controller
     // overlay stayed blank whenever a script was driving. It is the only way to see the overlay
     // without a controller in hand, so keep it fed here too.
@@ -1950,6 +1964,7 @@ void input_poll(PadState out[4]) {
   ui.gamecube = debug.gc_mask != 0;
   route_takeover(out);
   if (const uint16_t held = g_test_hold.load(std::memory_order_relaxed)) { out[0].button |= held; out[0].err = 0; }
+  apply_pulse(out);
   { std::lock_guard<std::mutex> lock(g_last_pads_mutex); for (int port = 0; port < 4; ++port) g_last_pads[port] = out[port]; }
   // MELEE_TEST_PAD_TRACE=<file> (tests only, hidden runs): one line each time a port's input changes,
   // as the game will read it, so a test that drives a controller can check every press arrived.
@@ -2120,6 +2135,10 @@ void input_stop_all_rumble() {
 }
 
 void input_test_hold(uint16_t buttons) { g_test_hold.store(buttons, std::memory_order_relaxed); }
+void input_pulse(int port, uint16_t buttons, int polls) {
+  if (port < 0 || port > 3) return;
+  g_pulse[port].store((uint32_t)std::clamp(polls, 0, 0x7FFF) << 16 | buttons, std::memory_order_relaxed);
+}
 
 void input_last_pads(PadState out[4]) {
   std::lock_guard<std::mutex> lock(g_last_pads_mutex);

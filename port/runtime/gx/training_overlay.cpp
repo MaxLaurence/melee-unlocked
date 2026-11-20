@@ -146,6 +146,23 @@ void set_advantage(int frames, int kind) {
   g_adv_kind = kind;
 }
 
+std::atomic<bool> g_wanted{false};
+void set_wanted(bool on) { g_wanted.store(on, std::memory_order_relaxed); }
+bool wanted() { return g_wanted.load(std::memory_order_relaxed); }
+bool latest(MuStatePod* state, MuPadStatus pads[4]) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_latest.valid) return false;
+  if (state) *state = g_latest.state;
+  if (pads) std::memcpy(pads, g_latest.pads, sizeof g_latest.pads);
+  return true;
+}
+bool advantage(int* frames, int* kind) {
+  std::lock_guard<std::mutex> lock(g_adv_mutex);
+  if (frames) *frames = g_adv_frames;
+  if (kind) *kind = g_adv_kind;
+  return g_adv_kind != 0;
+}
+
 void publish(const MuStatePod& state, const MuPadStatus pads[4]) {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_latest.valid = true;

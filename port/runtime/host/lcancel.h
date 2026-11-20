@@ -48,6 +48,21 @@ const char* auto_suppressed_mode();
 // True while an online session exists and its match has not started: matchmaking and the online
 // character select screen. The notice about the suppressed setting belongs here.
 bool online_session_pending();
+// ---- history, for the companion's Training page (gx/companion.h) ----
+// While wanted, every aerial landing of a local fighter is noted: whether it L-cancelled and how many
+// frames before the landing the L/R/Z press was (255: none in reach). Observes only, as the indicator.
+struct Landing {
+  int port = 0;
+  bool success = false;
+  int frames = 255;
+  uint32_t retrace = 0;
+};
+void set_history_wanted(bool on);
+// Any thread: the newest `max` landings, oldest first. `total`/`successes`: counted since the last reset.
+size_t recent_landings(Landing* out, size_t max, int* total = nullptr, int* successes = nullptr);
+void reset_history();
+int lcancel_window();   // the game's window (7 frames, 14 with some codes): what `frames` is compared to
+
 // True when this side presses for L-cancels in the current online session (set on, and the mode
 // allows it). Sent to Direct opponents in the build message so their screen can say so.
 bool automatic_active_online();

@@ -42,59 +42,70 @@ std::atomic<int64_t> g_raw_at{0};         // when the reader last delivered
 
 // slippi-android's StickCalibration: re-centre, the per-direction outer scale (only for unclipped raw
 // values), a radial deadzone, a power response curve and an output cap, keeping the direction.
-struct Calibration {
-  float center_x = 0, center_y = 0;
-  float scale_x_pos = 1, scale_x_neg = 1, scale_y_pos = 1, scale_y_neg = 1;
-  float deadzone = 0.02f, curve = 1.5f, cap = 1.0f;
-  void apply(float x, float y, bool outer_scale, float& ox, float& oy) const {
-    float dx = x - center_x, dy = y - center_y;
-    if (outer_scale) { dx *= dx >= 0 ? scale_x_pos : scale_x_neg; dy *= dy >= 0 ? scale_y_pos : scale_y_neg; }
-    const float mag = std::sqrt(dx * dx + dy * dy);
-    if (mag < deadzone || mag <= 0) { ox = oy = 0; return; }
-    float scaled = std::min(1.0f, (mag - deadzone) / (1.0f - deadzone));
-    if (curve > 1.0f) scaled = std::pow(scaled, curve);
-    scaled *= cap;
-    ox = dx / mag * scaled; oy = dy / mag * scaled;
-  }
-};
+using Calibration = android_host::StickCalibration;
+void apply(const Calibration& c, float x, float y, bool outer_scale, float& ox, float& oy) {
+  float dx = x - c.center_x, dy = y - c.center_y;
+  if (outer_scale) { dx *= dx >= 0 ? c.scale_x_pos : c.scale_x_neg; dy *= dy >= 0 ? c.scale_y_pos : c.scale_y_neg; }
+  const float mag = std::sqrt(dx * dx + dy * dy);
+  if (mag < c.deadzone || mag <= 0) { ox = oy = 0; return; }
+  float scaled = std::min(1.0f, (mag - c.deadzone) / (1.0f - c.deadzone));
+  if (c.curve > 1.0f) scaled = std::pow(scaled, c.curve);
+  scaled *= c.cap;
+  ox = dx / mag * scaled; oy = dy / mag * scaled;
+}
 // Its defaults for a reader that is still clipped by the firmware (the Thor's: about a quarter of the
 // nominal range): four times outward. Main stick: 2% deadzone, curve 1.5; C-stick: 10%, curve 2.0 (smashes
-// only, so a light flick must not smash). builtin-sticks.ini in the player's folder overrides them:
+// only, so a light flick must not smash). builtin-sticks.ini in the player's folder overrides them
+// (the companion's Sticks page writes it):
 //   main deadzone=0.02 curve=1.5 scale=4 cap=1 center_x=0 center_y=0
 //   c deadzone=0.10 curve=2.0 scale=4 cap=1
+// and per direction: scale_x_pos= scale_x_neg= scale_y_pos= scale_y_neg=
 struct Sticks { Calibration main, c; };
-const Sticks& sticks() {
-  static const Sticks loaded = [] {
-    Sticks s;
-    for (Calibration* cal : {&s.main, &s.c}) cal->scale_x_pos = cal->scale_x_neg = cal->scale_y_pos = cal->scale_y_neg = 4.0f;
-    s.c.deadzone = 0.10f; s.c.curve = 2.0f;
-    std::ifstream in("builtin-sticks.ini");   // the player's folder is the working folder (android_launch.h)
-    std::string line;
-    while (std::getline(in, line)) {
-      std::istringstream words(line);
-      std::string which, pair;
-      words >> which;
-      Calibration* cal = which == "main" ? &s.main : which == "c" ? &s.c : nullptr;
-      if (!cal) continue;
-      while (words >> pair) {
-        const auto eq = pair.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = pair.substr(0, eq);
-        const float v = std::strtof(pair.c_str() + eq + 1, nullptr);
-        if (key == "deadzone") cal->deadzone = std::clamp(v, 0.0f, 0.5f);
-        else if (key == "curve") cal->curve = std::clamp(v, 1.0f, 10.0f);
-        else if (key == "cap") cal->cap = std::clamp(v, 0.3f, 1.0f);
-        else if (key == "scale") cal->scale_x_pos = cal->scale_x_neg = cal->scale_y_pos = cal->scale_y_neg = std::clamp(v, 0.25f, 8.0f);
-        else if (key == "center_x") cal->center_x = std::clamp(v, -0.5f, 0.5f);
-        else if (key == "center_y") cal->center_y = std::clamp(v, -0.5f, 0.5f);
-      }
+Sticks defaults() {
+  Sticks s;
+  for (Calibration* cal : {&s.main, &s.c}) cal->scale_x_pos = cal->scale_x_neg = cal->scale_y_pos = cal->scale_y_neg = 4.0f;
+  s.c.deadzone = 0.10f; s.c.curve = 2.0f;
+  return s;
+}
+std::mutex g_sticks_mutex;
+bool g_sticks_loaded = false;
+Sticks g_sticks;
+const char* kIni = "builtin-sticks.ini";   // the player's folder is the working folder (android_launch.h)
+Sticks sticks() {
+  std::lock_guard<std::mutex> lock(g_sticks_mutex);
+  if (g_sticks_loaded) return g_sticks;
+  g_sticks_loaded = true;
+  Sticks s = defaults();
+  std::ifstream in(kIni);
+  std::string line;
+  while (std::getline(in, line)) {
+    std::istringstream words(line);
+    std::string which, pair;
+    words >> which;
+    Calibration* cal = which == "main" ? &s.main : which == "c" ? &s.c : nullptr;
+    if (!cal) continue;
+    while (words >> pair) {
+      const auto eq = pair.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string key = pair.substr(0, eq);
+      const float v = std::strtof(pair.c_str() + eq + 1, nullptr);
+      if (key == "deadzone") cal->deadzone = std::clamp(v, 0.0f, 0.5f);
+      else if (key == "curve") cal->curve = std::clamp(v, 1.0f, 10.0f);
+      else if (key == "cap") cal->cap = std::clamp(v, 0.3f, 1.0f);
+      else if (key == "scale") cal->scale_x_pos = cal->scale_x_neg = cal->scale_y_pos = cal->scale_y_neg = std::clamp(v, 0.25f, 8.0f);
+      else if (key == "scale_x_pos") cal->scale_x_pos = std::clamp(v, 0.25f, 8.0f);
+      else if (key == "scale_x_neg") cal->scale_x_neg = std::clamp(v, 0.25f, 8.0f);
+      else if (key == "scale_y_pos") cal->scale_y_pos = std::clamp(v, 0.25f, 8.0f);
+      else if (key == "scale_y_neg") cal->scale_y_neg = std::clamp(v, 0.25f, 8.0f);
+      else if (key == "center_x") cal->center_x = std::clamp(v, -0.5f, 0.5f);
+      else if (key == "center_y") cal->center_y = std::clamp(v, -0.5f, 0.5f);
     }
-    host::log("built-in sticks: main deadzone %.2f curve %.1f scale %.1f cap %.2f; C deadzone %.2f curve %.1f scale %.1f cap %.2f%s",
-              s.main.deadzone, s.main.curve, s.main.scale_x_pos, s.main.cap, s.c.deadzone, s.c.curve, s.c.scale_x_pos, s.c.cap,
-              in.is_open() ? " (builtin-sticks.ini)" : " (defaults)");
-    return s;
-  }();
-  return loaded;
+  }
+  host::log("built-in sticks: main deadzone %.2f curve %.1f scale %.1f cap %.2f; C deadzone %.2f curve %.1f scale %.1f cap %.2f%s",
+            s.main.deadzone, s.main.curve, s.main.scale_x_pos, s.main.cap, s.c.deadzone, s.c.curve, s.c.scale_x_pos, s.c.cap,
+            in.is_open() ? " (builtin-sticks.ini)" : " (defaults)");
+  g_sticks = s;
+  return s;
 }
 int16_t to_xinput(float v) { return (int16_t)std::clamp((int)std::lround(v * 32767.0f), -32768, 32767); }
 }  // namespace
@@ -117,13 +128,60 @@ bool builtin_sticks(uint16_t vendor, uint16_t product, int16_t& lx, int16_t& ly,
   if (logged.exchange(raw ? 1 : 0) != (raw ? 1 : 0))
     host::log("built-in sticks (pad %04X:%04X): %s", vendor, product,
               raw ? "unclipped values from the AYN mapping service" : "Android's values (no raw reader)");
-  const Sticks& s = sticks();
+  const Sticks s = sticks();
   float mx, my, cx, cy;
-  s.main.apply(v[0], v[1], raw, mx, my);
-  s.c.apply(v[2], v[3], raw, cx, cy);
+  apply(s.main, v[0], v[1], raw, mx, my);
+  apply(s.c, v[2], v[3], raw, cx, cy);
   lx = to_xinput(mx); ly = to_xinput(-my); rx = to_xinput(cx); ry = to_xinput(-cy);   // XInput's Y grows upward
   return true;
 }
+
+bool builtin_pad_present() { return g_builtin_pad.load(std::memory_order_relaxed) != 0; }
+
+bool builtin_raw(float out[4]) {
+  const bool fresh = now_ns() - g_raw_at.load(std::memory_order_acquire) < 100'000'000;
+  for (int i = 0; i < 4; ++i) out[i] = g_raw[i].load(std::memory_order_relaxed);
+  return fresh;
+}
+
+void builtin_calibration(StickCalibration& main, StickCalibration& c) {
+  const Sticks s = sticks();
+  main = s.main; c = s.c;
+}
+
+void set_builtin_calibration(const StickCalibration& main, const StickCalibration& c) {
+  sticks();   // loaded first, so a later first read does not replace these with the file's
+  std::lock_guard<std::mutex> lock(g_sticks_mutex);
+  g_sticks.main = main; g_sticks.c = c;
+}
+
+void default_builtin_calibration(StickCalibration& main, StickCalibration& c) {
+  const Sticks s = defaults();
+  main = s.main; c = s.c;
+}
+
+bool save_builtin_calibration() {
+  const Sticks s = sticks();
+  const std::string partial = std::string(kIni) + ".partial";
+  {
+    std::ofstream out(partial, std::ios::trunc);
+    if (!out) return false;
+    auto line = [&](const char* which, const Calibration& c) {
+      out << which << " deadzone=" << c.deadzone << " curve=" << c.curve << " cap=" << c.cap << " center_x=" << c.center_x
+          << " center_y=" << c.center_y << " scale_x_pos=" << c.scale_x_pos << " scale_x_neg=" << c.scale_x_neg
+          << " scale_y_pos=" << c.scale_y_pos << " scale_y_neg=" << c.scale_y_neg << "\n";
+    };
+    out << "# The AYN handheld's built-in sticks (Melee Unlocked's companion, Sticks page).\n";
+    line("main", s.main);
+    line("c", s.c);
+    if (!out.good()) return false;
+  }
+  if (std::rename(partial.c_str(), kIni) != 0) return false;
+  host::log("built-in sticks: calibration saved to %s", kIni);
+  return true;
+}
+
+void calibrate_stick(const StickCalibration& cal, float x, float y, bool raw, float& out_x, float& out_y) { apply(cal, x, y, raw, out_x, out_y); }
 
 }  // namespace android_host
 

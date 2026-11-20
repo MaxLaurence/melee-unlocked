@@ -104,6 +104,8 @@ struct State {
   int32_t trace_last = kNoFrame;   // the last frame whose ticks went to the overlay
 };
 State g;
+std::atomic<bool> g_fast_ui{false};      // the companion's fast forward (set_fast_forward)
+std::atomic<int> g_speed_request{-1};    // the companion's speed (set_speed_level), taken at the next frame
 
 const char* base_name(const std::string& path) {
   const size_t slash = path.find_last_of("\\/");
@@ -350,7 +352,8 @@ void poll_controls(int32_t frame, bool waiting) {
   if (k.home && !was.home) { g.want_seek = g.first_frame.load(); note_input(); }
   if ((k.slower && !was.slower) || (k.down && !was.down)) { set_speed(g.speed_index.load() - 1, frame); note_input(); }
   if ((k.faster && !was.faster) || (k.up && !was.up)) { set_speed(g.speed_index.load() + 1, frame); note_input(); }
-  const bool fast = !paused && (k.tab || trigger || g.fast_script);
+  if (const int wanted = g_speed_request.exchange(-1); wanted >= 0) { set_speed(wanted, frame); note_input(); }
+  const bool fast = !paused && (k.tab || trigger || g.fast_script || g_fast_ui.load(std::memory_order_relaxed));
   if (fast && !g.fast.load()) note_input();
   set_fast(fast, frame);
 }
@@ -732,6 +735,9 @@ Status status() {
 }
 
 void toggle_pause() { g.req_toggle.fetch_add(1); }
+void set_speed_level(int index) { g_speed_request.store(std::clamp(index, 0, kNormalSpeed)); }
+void set_fast_forward(bool on) { g_fast_ui.store(on, std::memory_order_relaxed); }
+bool fast_forward_held() { return g_fast_ui.load(std::memory_order_relaxed); }
 void seek_to(int32_t frame) { g.req_seek.store(frame); }
 void step_frame() { g_req_step.store(true); }
 void set_live_start(bool held) { g_live_start.store(held, std::memory_order_relaxed); }

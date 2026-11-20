@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The Android app: LauncherActivity (disc, Slippi sign-in, Play), MeleeActivity (the game, SDL's
      activity, in a process of its own so leaving the game returns to the launcher) and
-     SlippiLoginActivity (slippi.gg's sign-in page). versionCode and versionName come from build-apk.sh. -->
+     SlippiLoginActivity (slippi.gg's sign-in page); ViewerActivity: a second game on a handheld's second
+     screen (the companion itself is a Presentation of MeleeActivity's). versionCode and versionName come from build-apk.sh. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.meleeunlocked"
     android:installLocation="auto">
@@ -60,6 +61,22 @@
             <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/gc_adapter" />
         </activity>
 
+        <!-- A second game on the second screen (an arena room's match, a replay): its own process. -->
+        <activity android:name=".ViewerActivity"
+            android:process=":viewer"
+            android:exported="false"
+            android:taskAffinity="io.github.meleeunlocked.viewer"
+            android:excludeFromRecents="true"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation|density" />
+        <!-- Opens on the main screen and closes at once: the focus back there after a viewer opened. -->
+        <activity android:name=".FocusBounceActivity"
+            android:exported="false"
+            android:taskAffinity="io.github.meleeunlocked.focus"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen" />
         <activity android:name=".SlippiLoginActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode" />

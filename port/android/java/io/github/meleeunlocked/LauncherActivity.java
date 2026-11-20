@@ -45,10 +45,16 @@ public class LauncherActivity extends Activity {
     static final String KEY_DISC_URI = "disc_uri";
     static final String KEY_DISC_NAME = "disc_name";
     static final String KEY_DISC_PATH = "disc_path";
+    static final String KEY_BOTTOM_SCREEN = "bottom_screen";   // the companion on a second screen (BottomScreen)
+    // The game asked to be started again with arguments (MeleeActivity.requestRelaunch writes
+    // relaunchFile: a replay on the main screen) and to come back as usual after that run
+    // (KEY_RELAUNCH_RETURN, the launcher's own, while that run is under way).
+    static final String KEY_RELAUNCH_RETURN = "relaunch_return";
+    static File relaunchFile(Context context) { return new File(context.getFilesDir(), "relaunch-request"); }
     private static final int PICK_DISC = 1, SIGN_IN = 2;
 
     private TextView discLine, slippiLine, statusLine;
-    private Button play, chooseDisc, signIn;
+    private Button play, chooseDisc, signIn, bottomScreen;
     private volatile boolean assetsReady = false;
 
     /** The player's folder (settings, saves, replays): android_launch.h's default, under the files folder. */
@@ -88,6 +94,14 @@ public class LauncherActivity extends Activity {
         play = button(buttons, "Play", v -> startGame());
         chooseDisc = button(buttons, "Choose disc", v -> pickDisc());
         signIn = button(buttons, "Sign in to Slippi", v -> toggleSignIn());
+        // Only on a handheld with a second screen (the AYN Thor's bottom panel).
+        if (MeleeActivity.bottomDisplay(this) != null) {
+            bottomScreen = button(buttons, "", v -> {
+                SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                prefs.edit().putBoolean(KEY_BOTTOM_SCREEN, !prefs.getBoolean(KEY_BOTTOM_SCREEN, true)).apply();
+                refresh();
+            });
+        }
         setContentView(root);
         findDiscInAppFolder();
         refresh();
@@ -99,6 +113,7 @@ public class LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refresh();
+        relaunchIfAsked();
         getWindow().setDecorFitsSystemWindows(false);
         android.view.WindowInsetsController bars = getWindow().getInsetsController();
         if (bars != null) {
@@ -180,6 +195,8 @@ public class LauncherActivity extends Activity {
         String code = connectCode(this);
         slippiLine.setText(code != null ? "Slippi: signed in as " + code : "Slippi: not signed in (offline play works without it)");
         signIn.setText(code != null ? "Sign out" : "Sign in to Slippi");
+        if (bottomScreen != null)
+            bottomScreen.setText(prefs.getBoolean(KEY_BOTTOM_SCREEN, true) ? "Bottom screen: on" : "Bottom screen: off");
         play.setEnabled(name != null);
         play.setAlpha(name != null ? 1f : 0.5f);
         if (!assetsReady) statusLine.setText("Preparing game files…");
@@ -248,6 +265,47 @@ public class LauncherActivity extends Activity {
         } catch (Exception ignored) {
         }
         return null;
+    }
+
+    /** The game left to be started again (a replay on the main screen, then back to the game): once its
+     *  process has ended, start it with those arguments, or as usual after the replay's run. */
+    private void relaunchIfAsked() {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String asked = null;
+        boolean back = false;
+        File request = relaunchFile(this);
+        if (request.isFile()) {
+            try (InputStream in = new FileInputStream(request)) {
+                byte[] bytes = new byte[(int) Math.min(request.length(), 1 << 16)];
+                int n = 0, r;
+                while (n < bytes.length && (r = in.read(bytes, n, bytes.length - n)) > 0) n += r;
+                String text = new String(bytes, 0, n, StandardCharsets.UTF_8);
+                int nl = text.indexOf('\n');
+                if (nl > 0) { back = text.startsWith("1"); asked = text.substring(nl + 1).trim(); }
+            } catch (IOException ignored) {
+            }
+            //noinspection ResultOfMethodCallIgnored
+            request.delete();
+        }
+        final String args = asked != null && !asked.isEmpty() ? asked : null;
+        final boolean comeBack = prefs.getBoolean(KEY_RELAUNCH_RETURN, false);
+        if (args == null && !comeBack) return;
+        prefs.edit().putBoolean(KEY_RELAUNCH_RETURN, args != null && back).commit();
+        statusLine.setText(args != null ? "Starting the replay…" : "Back to the game…");
+        final long until = System.currentTimeMillis() + 4000;
+        final android.os.Handler handler = new android.os.Handler(getMainLooper());
+        handler.post(new Runnable() {
+            @Override public void run() {
+                if (MeleeActivity.processId(LauncherActivity.this, ":game") != 0 && System.currentTimeMillis() < until) {
+                    handler.postDelayed(this, 100);
+                    return;
+                }
+                statusLine.setText("");
+                Intent game = new Intent(LauncherActivity.this, MeleeActivity.class);
+                if (args != null) game.putExtra("args", args);
+                startActivity(game);
+            }
+        });
     }
 
     private void startGame() {

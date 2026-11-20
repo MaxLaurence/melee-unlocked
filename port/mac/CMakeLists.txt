@@ -146,7 +146,7 @@ foreach(removed
     runtime/gx/gx_dxc_linux.cpp runtime/gx/gx_vulkan.cpp)
   list(REMOVE_ITEM MAC_RUNTIME_SOURCES "${PORT}/${removed}")
 endforeach()
-add_library(mac_runtime STATIC ${MAC_RUNTIME_SOURCES} "${PORT}/third_party/slippilib/SlippiGame.cpp"
+add_library(mac_runtime STATIC ${MAC_RUNTIME_SOURCES} "${PORT}/third_party/slippilib/SlippiGame.cpp" "${PORT}/app/launcher_replay_data.cpp"
   "${COMPAT}/compat.cpp" "${COMPAT}/winhttp_ws.cpp" "${PORT}/linux/xinput_sdl.cpp" "${PORT}/linux/hid_linux.cpp"
   "${PORT}/linux/full/audio_sdl.cpp" "${PORT}/linux/full/linux_media.cpp" "${PORT}/linux/full/gpu_features_linux.cpp"
   "${MAC}/renderer_metal.cpp" "${MAC}/gx_backend_mac.cpp" "${MAC}/pc_settings_metal.cpp" "${MAC}/settings_window_mac.cpp")
@@ -159,7 +159,10 @@ target_include_directories(mac_runtime PUBLIC "${COMPAT}" "${PORT}/runtime/ppc" 
 target_compile_features(mac_runtime PUBLIC cxx_std_17)
 target_compile_options(mac_runtime PRIVATE ${MELEE_MAC_COMMON_FLAGS} ${MELEE_HOST_ARCH})
 # FFmpeg (build-deps.sh: the game's own formats only, static) for music packs, video backgrounds and pictures.
-target_include_directories(mac_runtime PRIVATE "${MELEE_MAC_DEPS}/include")
+target_include_directories(mac_runtime PRIVATE "${MELEE_MAC_DEPS}/include" "${PORT}/app")
+# The companion's pages (runtime/gx/companion.h): no second screen on a Mac, but MELEE_COMPANION_PREVIEW=1
+# shows them beside the game for development.
+target_compile_definitions(mac_runtime PUBLIC MELEE_COMPANION)
 foreach(lib avformat avcodec swscale swresample avutil)
   target_link_libraries(mac_runtime PUBLIC "${MELEE_MAC_DEPS}/lib/lib${lib}.a")
 endforeach()

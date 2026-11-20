@@ -3,6 +3,8 @@
 #include "gx_core.h"
 #include "render_options.h"
 #include <memory>
+struct ImGuiContext;
+namespace companion { struct Touch; }
 struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12GraphicsCommandList;
@@ -19,6 +21,20 @@ bool consume_lag_test_launch(const std::string& settings_path);
 void settings_set_game_aspect(float aspect);
 // Copy the same simulation frame's HUD anchors used by the presented image.
 void settings_set_hud_snapshot(const Frame& frame);
+// The companion (gx/companion.h): a handheld's second screen, in an ImGui context of its own that
+// shares the panel's fonts. A renderer with a second screen makes it after settings_context_create
+// (that context current), asks for a frame before settings_frame, and draws what it built after.
+bool settings_companion_create();
+void settings_companion_destroy();
+ImGuiContext* settings_companion_context();
+// Every frame: whether a second screen is there (the panel then belongs to it, built or not this frame).
+void settings_companion_present(bool present);
+// This frame: build the second screen too (size in pixels, the display's density, the touches since
+// the last). Reset by settings_frame.
+void settings_companion_request(int width, int height, float density, const ::companion::Touch* touches, size_t count);
+// After settings_frame: whether it built the second screen this frame (its draw data is then the
+// companion context's ImGui::GetDrawData()).
+bool settings_companion_built();
 // True once after a texture pack is switched on or off, so the backend can drop the textures it
 // uploaded under the old set. Reading it clears it.
 bool settings_textures_dirty();

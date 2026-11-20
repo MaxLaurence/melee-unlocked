@@ -322,6 +322,9 @@ void input_last_pads(PadState out[4]);
 // Tests only (MELEE_TEST_WARMUP's lr role): these buttons held on port 0 from the next poll on, as if
 // the controller pressed them (the game and every reader of input_last_pads see them); 0 lets go.
 void input_test_hold(uint16_t buttons);
+// The companion's Training page (gx/companion.h): `buttons` pressed on `port` for the next `polls`
+// controller reads, then let go, as if the controller pressed them (the Lab's D-pad save and load).
+void input_pulse(int port, uint16_t buttons, int polls);
 // GameCube controller adapter (WUP-028 over WinUSB): fills plugged ports, returns their mask.
 uint32_t gcadapter_poll(PadState out[4]);
 // PhobGCC settings for an adapter port (phob.h): applied to every report while enabled.

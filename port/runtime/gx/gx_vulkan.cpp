@@ -29,6 +29,11 @@
 #endif
 #endif
 #include <vulkan/vulkan.h>
+#ifdef __ANDROID__
+#include <vulkan/vulkan_android.h>
+#include "android_second_screen.h"   // port/android: the second screen's surface and touches
+#include "companion_input.h"
+#endif
 #include "gx_vulkan.h"
 #include "gx_shader.h"
 #include "gx_texture.h"
@@ -772,7 +777,7 @@ class VulkanBackend final : public Backend {
     host::perf::Scope wait_cost(host::perf::Stage::Wait);
     const VkResult r = vkWaitForPresentKHR(device_, swapchain_, last_present_id_, 100ull * 1000 * 1000);   // 100 ms, as the Direct3D 12 wait
     if (r == VK_SUCCESS) { present_wait_timeouts_ = 0; return; }
-    if (r == VK_SUBOPTIMAL_KHR) { swapchain_dirty_ = true; present_wait_timeouts_ = 0; return; }
+    if (r == VK_SUBOPTIMAL_KHR) { if (remake_when_suboptimal()) swapchain_dirty_ = true; present_wait_timeouts_ = 0; return; }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || exclusive_lost(r)) { swapchain_dirty_ = true; return; }
     if (r == VK_TIMEOUT) {
       if (++present_wait_timeouts_ < 3) return;
@@ -1100,8 +1105,20 @@ class VulkanBackend final : public Backend {
     if (offered.count(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME); memory_budget_on_ = true; }
     // Each draw's constants, textures and samplers written straight into the command buffer
     // (vkCmdPushDescriptorSetKHR) instead of a descriptor set allocated and written for every draw:
-    // less work per draw, and no limit on draws a frame. MELEE_VULKAN_PUSH_DESCRIPTORS=0 for A/B.
-    static const bool push_wanted = [] { const char* v = std::getenv("MELEE_VULKAN_PUSH_DESCRIPTORS"); return !(v && *v == '0'); }();
+    // less work per draw, and no limit on draws a frame. MELEE_VULKAN_PUSH_DESCRIPTORS=0 or 1 for A/B.
+    // Not on Android: Qualcomm's driver (Adreno 740, AYN Thor, driver 0676.53) faulted inside
+    // vkEndCommandBuffer after one to two minutes of a match with every draw pushed (18 descriptors,
+    // ~1,600 draws a frame), with the validation layer reporting nothing; with a set per draw the same
+    // scripted match ran to its end at 120 fps, and the frame's CPU cost went down rather than up.
+    static const bool push_wanted = [] {
+      const char* v = std::getenv("MELEE_VULKAN_PUSH_DESCRIPTORS");
+      if (v && (*v == '0' || *v == '1')) return *v == '1';
+#ifdef __ANDROID__
+      return false;
+#else
+      return true;
+#endif
+    }();
     if (push_wanted && offered.count(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) { extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); push_descriptors_on_ = true; }
     // AMD FSR's compute shaders use compute-shader derivatives (KHR, or NVIDIA's earlier name for it).
     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
@@ -1279,7 +1296,294 @@ class VulkanBackend final : public Backend {
     return true;
   }
   static bool surface_gone(VkResult r) { return r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR; }
+
+  // ---- the second screen (a handheld's bottom panel: port/android/android_second_screen.h) ----
+  // The companion's pages (gx/companion.h), built by settings_frame in their own ImGui context, drawn
+  // here into a swapchain of their own after the game's frame is presented: at most 60 times a
+  // second, and only when an image is free at once, so the game's frame never waits for it.
+  struct Second {
+    android_host::SecondSurface surface;   // held (generation 0: none)
+    VkSurfaceKHR vk_surface = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    std::vector<VkSemaphore> done;
+    VkCommandPool pool[2]{};
+    VkCommandBuffer cmd[2]{};
+    VkFence fence[2]{};
+    VkSemaphore acquired[2]{};
+    int slot = 0;
+    bool dirty = false, lost = false, imgui_ready = false, failed_logged = false;
+    VkFormat imgui_format = VK_FORMAT_UNDEFINED;
+    double last_frame = 0.0;
+    std::vector<::companion::Touch> touches;
+  };
+  Second second_;
+
+  void second_destroy_swapchain() {
+    Second& s = second_;
+    if (s.swapchain || s.vk_surface) vkDeviceWaitIdle(device_);
+    for (VkImageView v : s.views) vkDestroyImageView(device_, v, nullptr);
+    for (VkSemaphore d : s.done) vkDestroySemaphore(device_, d, nullptr);
+    s.views.clear(); s.done.clear(); s.images.clear();
+    if (s.swapchain) { vkDestroySwapchainKHR(device_, s.swapchain, nullptr); s.swapchain = VK_NULL_HANDLE; }
+  }
+  void second_drop_surface() {
+    Second& s = second_;
+    second_destroy_swapchain();
+    if (s.vk_surface) { vkDestroySurfaceKHR(instance_, s.vk_surface, nullptr); s.vk_surface = VK_NULL_HANDLE; }
+    if (s.surface.window) android_host::second_screen_release(s.surface);
+    s.surface = {};
+    s.lost = s.dirty = false;
+  }
+  bool second_create_swapchain() {
+    Second& s = second_;
+    second_destroy_swapchain();
+    VkBool32 supported = VK_FALSE;
+    if (vkGetPhysicalDeviceSurfaceSupportKHR) vkGetPhysicalDeviceSurfaceSupportKHR(physical_, queue_family_, s.vk_surface, &supported);
+    VkSurfaceCapabilitiesKHR caps;
+    if (!supported || vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, s.vk_surface, &caps) != VK_SUCCESS) return false;
+    // As the main screen: drawn upright at the surface's own size, turned by the compositor.
+    VkExtent2D extent{(uint32_t)s.surface.width, (uint32_t)s.surface.height};
+    extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+    extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    if (!extent.width || !extent.height) return false;
+    uint32_t n = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, s.vk_surface, &n, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(n);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, s.vk_surface, &n, formats.data());
+    if (formats.empty()) return false;
+    VkSurfaceFormatKHR format = formats[0];
+    for (const auto& f : formats)
+      if ((f.format == VK_FORMAT_R8G8B8A8_UNORM || f.format == VK_FORMAT_B8G8R8A8_UNORM) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        format = f;
+        if (f.format == s.imgui_format) break;   // the overlay pipeline's, when it has one
+      }
+    VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    info.surface = s.vk_surface;
+    info.minImageCount = std::max(caps.minImageCount, 2u) + 1;
+    if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
+    info.imageFormat = format.format; info.imageColorSpace = format.colorSpace;
+    info.imageExtent = extent; info.imageArrayLayers = 1;
+    info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
+    info.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                        : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                                                                                            : VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    info.clipped = VK_TRUE;
+    if (vkCreateSwapchainKHR(device_, &info, nullptr, &s.swapchain) != VK_SUCCESS) { s.swapchain = VK_NULL_HANDLE; return false; }
+    s.format = format.format;
+    s.extent = extent;
+    uint32_t count = 0;
+    vkGetSwapchainImagesKHR(device_, s.swapchain, &count, nullptr);
+    s.images.resize(count);
+    vkGetSwapchainImagesKHR(device_, s.swapchain, &count, s.images.data());
+    for (VkImage image : s.images) {
+      VkImageViewCreateInfo v{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      v.image = image; v.viewType = VK_IMAGE_VIEW_TYPE_2D; v.format = s.format;
+      v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      VkImageView view = VK_NULL_HANDLE;
+      vkCreateImageView(device_, &v, nullptr, &view);
+      s.views.push_back(view);
+      VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+      VkSemaphore done = VK_NULL_HANDLE;
+      vkCreateSemaphore(device_, &si, nullptr, &done);
+      s.done.push_back(done);
+    }
+    if (!s.cmd[0]) {
+      for (int i = 0; i < 2; ++i) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = queue_family_;
+        vkCreateCommandPool(device_, &pi, nullptr, &s.pool[i]);
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = s.pool[i]; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+        vkAllocateCommandBuffers(device_, &ai, &s.cmd[i]);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        vkCreateFence(device_, &fi, nullptr, &s.fence[i]);
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        vkCreateSemaphore(device_, &si, nullptr, &s.acquired[i]);
+      }
+    }
+    host::log("companion: second screen %ux%u, format %d, transform 0x%x (surface reports %ux%u, transform 0x%x)", extent.width, extent.height,
+              (int)s.format, (unsigned)info.preTransform, caps.currentExtent.width, caps.currentExtent.height, (unsigned)caps.currentTransform);
+    s.dirty = false;
+    return true;
+  }
+  // The companion's ImGui context gets its own Vulkan overlay, for the second screen's format.
+  bool second_imgui() {
+    Second& s = second_;
+    if (s.imgui_ready && s.imgui_format == s.format) return true;
+    ImGuiContext* main = ImGui::GetCurrentContext();
+    if (!settings_companion_create()) return false;
+    ImGui::SetCurrentContext(settings_companion_context());
+    if (!s.imgui_ready) {
+      ImGui_ImplVulkan_InitInfo info{};
+      info.ApiVersion = VK_API_VERSION_1_3; info.Instance = instance_; info.PhysicalDevice = physical_; info.Device = device_;
+      info.QueueFamily = queue_family_; info.Queue = queue_; info.DescriptorPoolSize = 64;
+      info.MinImageCount = 2; info.ImageCount = 6;
+      info.UseDynamicRendering = true;
+      info.PipelineInfoMain.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+      info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+      info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &s.format;
+      s.imgui_ready = ImGui_ImplVulkan_Init(&info);
+    } else {
+      ImGui_ImplVulkan_PipelineInfo pipeline{};
+      pipeline.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+      pipeline.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+      pipeline.PipelineRenderingCreateInfo.pColorAttachmentFormats = &s.format;
+      ImGui_ImplVulkan_CreateMainPipeline(&pipeline);
+    }
+    s.imgui_format = s.format;
+    ImGui::SetCurrentContext(main);
+    if (!s.imgui_ready) host::log("companion: no overlay for the second screen");
+    return s.imgui_ready;
+  }
+  void second_destroy_all() {
+    Second& s = second_;
+    if (!s.cmd[0] && !s.surface.window && !s.imgui_ready) return;
+    vkDeviceWaitIdle(device_);
+    if (s.imgui_ready && settings_companion_context()) {
+      ImGuiContext* main = ImGui::GetCurrentContext();
+      ImGui::SetCurrentContext(settings_companion_context());
+      ImGui_ImplVulkan_Shutdown();
+      ImGui::SetCurrentContext(main);
+      s.imgui_ready = false;
+    }
+    settings_companion_destroy();
+    second_drop_surface();
+    for (int i = 0; i < 2; ++i) {
+      if (s.fence[i]) vkDestroyFence(device_, s.fence[i], nullptr);
+      if (s.acquired[i]) vkDestroySemaphore(device_, s.acquired[i], nullptr);
+      if (s.pool[i]) vkDestroyCommandPool(device_, s.pool[i], nullptr);
+      s.fence[i] = VK_NULL_HANDLE; s.acquired[i] = VK_NULL_HANDLE; s.pool[i] = VK_NULL_HANDLE; s.cmd[i] = VK_NULL_HANDLE;
+    }
+  }
+  // Before settings_frame: follow the surface Android gives, and ask for the companion's frame when
+  // one is due.
+  void second_prepare() {
+    Second& s = second_;
+    for (const android_host::Touch& t : android_host::second_screen_touches()) s.touches.push_back({t.action, t.pointer, t.x, t.y});
+    const uint64_t generation = android_host::second_screen_generation();
+    if (generation != s.surface.generation || s.lost) {
+      second_drop_surface();
+      if (generation) {
+        s.surface = android_host::second_screen_acquire();
+        if (s.surface.window) {
+          auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(vkGetInstanceProcAddr(instance_, "vkCreateAndroidSurfaceKHR"));
+          VkAndroidSurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};
+          ci.window = s.surface.window;
+          if (!create || create(instance_, &ci, nullptr, &s.vk_surface) != VK_SUCCESS) {
+            s.vk_surface = VK_NULL_HANDLE;
+            if (!s.failed_logged) host::log("companion: no Vulkan surface on the second screen");
+            s.failed_logged = true;
+            android_host::second_screen_release(s.surface);
+            s.surface = {};
+            s.surface.generation = generation;   // not tried again until Android gives another
+          } else {
+            s.dirty = true;
+          }
+        }
+      }
+    }
+    settings_companion_present(false);
+    if (!s.vk_surface) { s.touches.clear(); return; }
+    if (s.dirty && !second_create_swapchain()) { s.dirty = true; return; }
+    if (!s.swapchain || !second_imgui()) return;
+    settings_companion_present(true);   // the panel belongs to the second screen, drawn this frame or not
+    const double now = host::now_seconds();
+    if (now - s.last_frame < 1.0 / 60.0 - 0.002) return;   // the touches wait for the next frame
+    settings_companion_request((int)s.extent.width, (int)s.extent.height, s.surface.density, s.touches.data(), s.touches.size());
+    s.touches.clear();
+  }
+  // After the game's frame: draw what settings_frame built for the second screen and show it.
+  void second_present() {
+    Second& s = second_;
+    if (!settings_companion_built() || !s.swapchain || !s.imgui_ready) return;
+    const int slot = s.slot;
+    if (vkWaitForFences(device_, 1, &s.fence[slot], VK_TRUE, 0) != VK_SUCCESS) return;   // the GPU still has it: next time
+    uint32_t image = 0;
+    const VkResult got = vkAcquireNextImageKHR(device_, s.swapchain, 0, s.acquired[slot], VK_NULL_HANDLE, &image);
+    if (got == VK_NOT_READY || got == VK_TIMEOUT) return;
+    if (got == VK_ERROR_OUT_OF_DATE_KHR) { s.dirty = true; return; }
+    if (surface_gone(got)) { s.lost = true; return; }
+    if (got != VK_SUCCESS && got != VK_SUBOPTIMAL_KHR) return;
+    s.slot ^= 1;
+    s.last_frame = host::now_seconds();
+    vkResetFences(device_, 1, &s.fence[slot]);
+    vkResetCommandPool(device_, s.pool[slot], 0);
+    VkCommandBuffer cmd = s.cmd[slot];
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+    VkImageMemoryBarrier to_draw{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_draw.srcAccessMask = 0; to_draw.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_draw.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; to_draw.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_draw.srcQueueFamilyIndex = to_draw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_draw.image = s.images[image]; to_draw.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_draw);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = s.views[image]; color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.clearValue.color = {{0.055f, 0.063f, 0.086f, 1.0f}};
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, s.extent}; info.layerCount = 1;
+    info.colorAttachmentCount = 1; info.pColorAttachments = &color;
+    vkCmdBeginRendering(cmd, &info);
+    ImGuiContext* main = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(settings_companion_context());
+    if (ImDrawData* data = ImGui::GetDrawData()) {
+      // A picture the panel registered with the game's own context (a skin preview) and that context's
+      // renderer has not made yet is not drawn here (it would bind nothing); it shows once it exists.
+      for (ImDrawList* list : data->CmdLists)
+        for (ImDrawCmd& c : list->CmdBuffer) {
+          ImTextureData* tex = c.TexRef._TexData;
+          if (tex && tex->TexID == ImTextureID_Invalid && (!data->Textures || !data->Textures->contains(tex))) c.ElemCount = 0;
+        }
+      ImGui_ImplVulkan_RenderDrawData(data, cmd);
+    }
+    ImGui::SetCurrentContext(main);
+    vkCmdEndRendering(cmd);
+    VkImageMemoryBarrier to_show = to_draw;
+    to_show.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; to_show.dstAccessMask = 0;
+    to_show.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; to_show.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_show);
+    vkEndCommandBuffer(cmd);
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &s.acquired[slot]; submit.pWaitDstStageMask = &wait_stage;
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd;
+    submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &s.done[image];
+    if (vkQueueSubmit(queue_, 1, &submit, s.fence[slot]) != VK_SUCCESS) { s.lost = true; return; }
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1; present.pWaitSemaphores = &s.done[image];
+    present.swapchainCount = 1; present.pSwapchains = &s.swapchain; present.pImageIndices = &image;
+    const VkResult shown = vkQueuePresentKHR(queue_, &present);
+    // SUBOPTIMAL is Android saying the panel is turned and the compositor turns the picture: drawn
+    // upright on purpose (as the main screen), so it is not a reason to make the swapchain again.
+    if (shown == VK_ERROR_OUT_OF_DATE_KHR) s.dirty = true;
+    else if (surface_gone(shown)) s.lost = true;
+  }
 #endif
+
+  // VK_SUBOPTIMAL_KHR: a reason to make the swapchain again, except on Android, which answers it to
+  // every acquire and present because the frame is drawn upright on a turned panel and the
+  // compositor turns it (on purpose, create_swapchain). Made again there for every frame, the old
+  // swapchain and its semaphores went every frame too, and after a minute or so of play the Adreno
+  // driver faulted inside vkEndCommandBuffer (0.9.220 on an AYN Thor). Real size changes come
+  // through resize() and OUT_OF_DATE as everywhere.
+  static bool remake_when_suboptimal() {
+#ifdef __ANDROID__
+    return false;
+#else
+    return true;
+#endif
+  }
+  uint64_t swapchains_made_ = 0;
 
   void create_swapchain() {
     if (window_.drawable_size) window_.drawable_size(&client_w_, &client_h_);
@@ -1363,7 +1667,12 @@ class VulkanBackend final : public Backend {
     info.imageFormat = format.format; info.imageColorSpace = format.colorSpace; info.imageExtent = extent;
     info.imageArrayLayers = 1; info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; info.preTransform = transform;
-    info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; info.presentMode = present_mode_; info.clipped = VK_TRUE;
+    // Opaque where the surface offers it; Android's often offers only INHERIT (the window's own).
+    info.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                        : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) ? VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+                        : (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) ? VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+                                                                                                   : VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    info.presentMode = present_mode_; info.clipped = VK_TRUE;
     info.oldSwapchain = swapchain_;
     VkSwapchainKHR created = VK_NULL_HANDLE;
     VkSwapchainLatencyCreateInfoNV latency{VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
@@ -1388,6 +1697,8 @@ class VulkanBackend final : public Backend {
     release_exclusive();   // the old swapchain's, before it goes
     destroy_swapchain();
     swapchain_ = created; swap_extent_ = extent;
+    if (++swapchains_made_ <= 3 || swapchains_made_ % 100 == 0)
+      host::log("vulkan: swapchain %llu made, %ux%u", (unsigned long long)swapchains_made_, extent.width, extent.height);
     present_id_ = last_present_id_ = 0; present_wait_timeouts_ = 0;   // present ids count per swapchain
     timing_reset();
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
@@ -1637,6 +1948,9 @@ class VulkanBackend final : public Backend {
       pending_white_ = false;
     }
 #ifdef GX_PC_SETTINGS
+#ifdef __ANDROID__
+    if (settings_ui_ready()) second_prepare();
+#endif
     if (settings_ui_ready()) {
       if (settings_textures_dirty()) drop_textures();
       settings_set_game_aspect(presented_aspect(opts_, client_w_, client_h_, frame_widenable_));
@@ -1768,11 +2082,11 @@ class VulkanBackend final : public Backend {
       stat_acquire_ += acquire_wait_; stat_wait_ += spin_start - wait_start; stat_spin_ += present_call - spin_start;
       stat_present_ += present_end - present_call; ++stat_frames_;
       if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { present_id_ = id; if (present_id_on_) last_present_id_ = id; }
-      if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || exclusive_lost(r)) swapchain_dirty_ = true;
+      if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && remake_when_suboptimal()) || exclusive_lost(r)) swapchain_dirty_ = true;
 #ifdef __ANDROID__
       else if (surface_gone(r)) { surface_lost_ = true; swapchain_dirty_ = true; }
 #endif
-      else if (r != VK_SUCCESS) check(r, "present");
+      else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) check(r, "present");   // shown all the same
       ++presented_;
       if ((presented_ & 31) == 0) update_variable_refresh();
 #ifdef _WIN32
@@ -1786,6 +2100,9 @@ class VulkanBackend final : public Backend {
     acquired_ = false;
 #ifdef _WIN32
     fsr_fg_generated_ = false;
+#endif
+#if defined(__ANDROID__) && defined(GX_PC_SETTINGS)
+    second_present();
 #endif
   }
 
@@ -2480,7 +2797,7 @@ class VulkanBackend final : public Backend {
     if (surface_gone(r)) { surface_lost_ = true; swapchain_dirty_ = true; return; }
 #endif
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) check(r, "acquire");
-    if (r == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
+    if (r == VK_SUBOPTIMAL_KHR && remake_when_suboptimal()) swapchain_dirty_ = true;
     acquired_ = true;
     // As the Direct3D renderers: the widescreen setting also drives the Slippi code, and FoD
     // reflections and True widescreen follow the settings every frame (game changes, not drawing).
@@ -3317,6 +3634,9 @@ class VulkanBackend final : public Backend {
   }
   void destroy_settings_ui() {
     if (!settings_ready_) return;
+#ifdef __ANDROID__
+    second_destroy_all();
+#endif
     if (imgui_picture_pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, imgui_picture_pipeline_, nullptr); imgui_picture_pipeline_ = VK_NULL_HANDLE; }
     for (auto& [samples, p] : card_pipelines_) if (p != VK_NULL_HANDLE) vkDestroyPipeline(device_, p, nullptr);
     card_pipelines_.clear();

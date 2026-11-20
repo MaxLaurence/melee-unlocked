@@ -60,9 +60,17 @@ float4 hud(float2 uv, float4 c) {
 // Optional screen-space ambient occlusion approximation. Melee uses reversed depth (clear = 0),
 // so nearer samples have larger depth. It darkens contact edges only and leaves cleared pixels
 // alone. This is a lightweight display effect, not hardware ray tracing.
+// Depth is read texel by texel: a 32-bit float depth format need not be filterable (Adreno's is
+// not), and sampling one through the linear sampler is undefined in Vulkan.
+float depth_at(float2 uv) {
+  uint w, h;
+  efb_depth.GetDimensions(w, h);
+  int2 p = clamp(int2(uv * float2(w, h)), int2(0, 0), int2(int(w) - 1, int(h) - 1));
+  return efb_depth.Load(int3(p, 0)).r;
+}
 float ao(float2 uv) {
   if (color.w <= 0.0) return 1.0;
-  float d = efb_depth.Sample(samp, uv).r;
+  float d = depth_at(uv);
   if (d <= 0.00001) return 1.0;
   uint depth_w, depth_h;
   efb_depth.GetDimensions(depth_w, depth_h);
@@ -71,7 +79,7 @@ float ao(float2 uv) {
   float occ = 0.0;
   float bias = max(0.0015, d * 0.012);
   [unroll] for (int k = 0; k < 8; ++k) {
-    float nd = efb_depth.Sample(samp, uv + dirs[k] * px).r;
+    float nd = depth_at(uv + dirs[k] * px);
     occ += nd > d + bias ? 1.0 : 0.0;
   }
   return saturate(1.0 - (occ * 0.125) * color.w);

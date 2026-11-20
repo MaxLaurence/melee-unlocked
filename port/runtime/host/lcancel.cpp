@@ -46,6 +46,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include "gx_shader.h"
 #include "ppc.h"
@@ -119,6 +120,21 @@ float rdf32(uint32_t addr) { uint32_t v = rd32(addr); float f; std::memcpy(&f, &
 
 // ---- settings
 std::atomic<int> g_indicator{MU_LCFLASH_OFF};
+// The companion's landing history (set_history_wanted).
+std::atomic<bool> g_history_wanted{false};
+std::atomic<int> g_history_window{7};
+std::mutex g_history_mutex;
+Landing g_history[64];
+size_t g_history_next = 0, g_history_count = 0;
+int g_history_total = 0, g_history_successes = 0;
+void note_landing(int port, bool success, int frames, uint32_t retrace) {
+  std::lock_guard<std::mutex> lock(g_history_mutex);
+  g_history[g_history_next] = Landing{port, success, frames, retrace};
+  g_history_next = (g_history_next + 1) % 64;
+  if (g_history_count < 64) ++g_history_count;
+  ++g_history_total;
+  if (success) ++g_history_successes;
+}
 std::atomic<bool> g_automatic{false};
 std::string g_log_path;
 FILE* g_log = nullptr;
@@ -344,6 +360,21 @@ void set_automatic(bool on) {
 }
 bool automatic_setting_locked() { return policy::automatic_setting_locked(slippi::online::session_mode_or_parked()); }
 bool indicator_enabled() { return flash_mode() != MU_LCFLASH_OFF; }
+void set_history_wanted(bool on) { g_history_wanted.store(on, std::memory_order_relaxed); }
+size_t recent_landings(Landing* out, size_t max, int* total, int* successes) {
+  std::lock_guard<std::mutex> lock(g_history_mutex);
+  const size_t n = std::min(max, g_history_count);
+  for (size_t i = 0; i < n; ++i) out[i] = g_history[(g_history_next + 64 - n + i) % 64];
+  if (total) *total = g_history_total;
+  if (successes) *successes = g_history_successes;
+  return n;
+}
+void reset_history() {
+  std::lock_guard<std::mutex> lock(g_history_mutex);
+  g_history_next = g_history_count = 0;
+  g_history_total = g_history_successes = 0;
+}
+int lcancel_window() { return g_history_window.load(std::memory_order_relaxed); }
 bool automatic_enabled() { return g_automatic.load(std::memory_order_relaxed); }
 
 void set_log_path(const std::string& path) {
@@ -374,7 +405,8 @@ void apply(host::PadState pads[4]) {
   const bool want_indicator = indicator_enabled();
   const bool want_auto = automatic_enabled() && !host::gameplay::vanilla_only();
   // Default state: not one guest read, not one byte changed, so the game is bit for bit the game.
-  if (!want_indicator && !want_auto && !g_log) { release_renderer(); return; }
+  const bool want_history = g_history_wanted.load(std::memory_order_relaxed);
+  if (!want_indicator && !want_auto && !g_log && !want_history) { release_renderer(); return; }
 
   const uint32_t retrace = host::retrace_count();
   if (retrace == g_last_retrace) {
@@ -448,6 +480,10 @@ void apply(host::PadState pads[4]) {
       const bool success = since < (uint8_t)std::min(window, 255);
       if (mu_lcancel_renderer_reports(flash_mode(), success))
         raise_flash(fighter.slot, p, since, retrace, success);
+    }
+    if (want_history && (!online || p == 0) && motion >= kLandingAirN && motion <= kLandingAirLw && motion != st.last_motion) {
+      g_history_window.store(window, std::memory_order_relaxed);
+      note_landing(p, since < (uint8_t)std::min(window, 255), since, retrace);
     }
 
     // ---- Automatic L-cancel.

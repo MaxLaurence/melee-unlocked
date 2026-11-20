@@ -72,6 +72,10 @@
 #include "gx_shader.h"
 #include "render_options.h"
 #include "training_overlay.h"
+#include "companion.h"
+#ifdef __ANDROID__
+#include "android_second_screen.h"
+#endif
 #include "ghost_ai.h"
 #include "practice_cpu.h"
 #include "lcancel.h"
@@ -2541,7 +2545,7 @@ void h_pad_read(MuPadStatus out[4]) {
   training_overlay::set_input_display(te_host_feature(MU_GAME_OPTION2_TE_INPUT_DISPLAY));
   // Training Lab overlay: what the game read this frame, with the fighters' state.
   if (((gx::RenderOptions::live_te_options() & (MU_GAME_OPTION_LAB | MU_GAME_OPTION_LAB_OVERLAY)) ==
-           (MU_GAME_OPTION_LAB | MU_GAME_OPTION_LAB_OVERLAY) || training_overlay::input_display()) &&
+           (MU_GAME_OPTION_LAB | MU_GAME_OPTION_LAB_OVERLAY) || training_overlay::input_display() || training_overlay::wanted()) &&
       g_game.state_snapshot) {
     MuStatePod state{};
     g_game.state_snapshot(&state);
@@ -3267,6 +3271,19 @@ void* launch_arena_viewer(const std::string& path) {
   host::log("arena: viewer pid %lu", pi.dwProcessId);
   return pi.hProcess;
 }
+#elif !defined(MELEE_NO_SLIPPI) && defined(__ANDROID__)
+// Android: the viewer is a second game, in a process of its own, on the handheld's second screen
+// (MeleeActivity.launchViewer, port/android): the live recording, muted. slippi_arena.cpp asks the
+// activity whether it still runs and closes it there (android_second_screen.h).
+void* launch_arena_viewer(const std::string& path) {
+  if (!android_host::second_display()) { host::log("arena: no second screen for the room's match"); return nullptr; }
+  const std::filesystem::path live = std::filesystem::u8path(path);
+  const std::vector<std::string> args = {"--replay", path, "--spectate-view", std::to_string(std::clamp(gx::RenderOptions::live_spectate_view(), 0, 2)),
+                                         "--replay-dir", (live.parent_path() / "viewer").u8string(), "--volume", "0"};
+  if (!android_host::viewer_launch(args)) { host::log("arena: the room's match did not open on the second screen"); return nullptr; }
+  host::log("arena: the room's match opened on the second screen");
+  return reinterpret_cast<void*>(static_cast<uintptr_t>(1));
+}
 #elif !defined(MELEE_NO_SLIPPI)
 void* launch_arena_viewer(const std::string&) { return nullptr; }
 #endif
@@ -3521,7 +3538,7 @@ void write_replay_recording(bool in_background) {
       const bool closed = std::fclose(f) == 0;
       g_replay_written = written && closed;
       host::log("replay: %s %s (%zu bytes)", g_replay_written ? "recording written to" : "write failed for", out.u8string().c_str(), file.size());
-      if (g_replay_written) net_trace::replay_saved(out.u8string().c_str());
+      if (g_replay_written) { net_trace::replay_saved(out.u8string().c_str()); companion::replay_saved(out.u8string()); }
       return;
     }
     host::log("replay: recording name collision limit reached");
@@ -3559,7 +3576,7 @@ void write_replay_recording(bool in_background) {
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
       host::log("replay: %s %s (%zu bytes, %.0f ms)", ok && closed ? "recording written to" : "write failed for",
                 out.string().c_str(), file.size(), ms);
-      if (ok && closed) net_trace::replay_saved(out.string().c_str());
+      if (ok && closed) { net_trace::replay_saved(out.string().c_str()); companion::replay_saved(out.u8string()); }
     } else {
       host::log("replay: cannot write %s (error %lu)", out.string().c_str(), GetLastError());
     }

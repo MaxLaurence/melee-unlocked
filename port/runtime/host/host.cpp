@@ -5,6 +5,9 @@
 #include "yougame_agent_paths.h"
 #endif
 #include "host.h"
+#ifdef __ANDROID__
+#include "android_second_screen.h"
+#endif
 #include "sim_work.h"
 #include "audio.h"
 #include "cosmetic_mods.h"
@@ -347,6 +350,9 @@ void wait_file_writes(unsigned max_ms) {
   set_process_ending();
   log_flush();
   std::fflush(nullptr);
+#ifdef __ANDROID__
+  android_host::before_process_end();   // a relaunch into a replay: the launcher takes it from here
+#endif
   TerminateProcess(GetCurrentProcess(), (UINT)code);
   std::abort();   // not reached
 }

@@ -4,6 +4,8 @@
 #include "gecko_session.h"
 #include "test_env.h"
 #include "pc_settings.h"
+#include "companion.h"
+#include "companion_input.h"
 #include "settings_imgui_input.h"
 #ifdef __APPLE__
 #include "../../mac/platform_paths.h"
@@ -380,6 +382,7 @@ void settings_set_hud_snapshot(const Frame& frame) {
   g_hud_players = frame.hud_players;
   g_hud_player_names = frame.player_names;
   combo_track(frame.sequence);
+  ::companion::note_frame(frame);
 }
 
 // The Arcade look's combo counter (counted in combo_track): "N HITS" over the attacker, in the game's
@@ -3647,8 +3650,107 @@ void settings_context_destroy() {
 #else
   ImGui_ImplSDL2_Shutdown();
 #endif
+  settings_companion_destroy();
   ImGui::DestroyContext();
 }
+
+// ---- the companion's context (pc_settings.h, gx/companion.h)
+namespace {
+ImGuiContext* g_companion_context = nullptr;
+struct CompanionRequest {
+  bool on = false;
+  int width = 0, height = 0;
+  float density = 1.0f;
+  std::vector<::companion::Touch> touches;
+};
+CompanionRequest g_companion_request;
+bool g_companion_present = false;   // a second screen is there (settings_companion_present)
+bool g_companion_built = false;
+double g_companion_time = 0.0;
+// The keys the controller fed the main context this frame (the panel follows the controller on the
+// second screen too).
+struct NavFeed {
+  bool active = false;
+  bool start = false, back = false, a = false, b = false, up = false, down = false, left = false, right = false;
+};
+}  // namespace
+
+bool settings_companion_create() {
+  if (g_companion_context) return true;
+  ImGuiContext* main = ImGui::GetCurrentContext();
+  if (!main) return false;
+  ImFontAtlas* fonts = ImGui::GetIO().Fonts;
+  const ImGuiStyle style = ImGui::GetStyle();
+  g_companion_context = ImGui::CreateContext(fonts);   // the panel's fonts (and their ImFont pointers)
+  ImGui::SetCurrentContext(g_companion_context);
+  ImGuiIO& io = ImGui::GetIO();
+  io.IniFilename = nullptr;
+  io.ConfigDebugHighlightIdConflicts = false; io.ConfigDebugHighlightIdConflictsShowItemPicker = false;
+  io.BackendPlatformName = "melee-unlocked-companion";
+  io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
+  settings_input::configure(io);
+  ImGui::GetStyle() = style;
+  ImGui::SetCurrentContext(main);
+  host::log("companion: second screen context ready");
+  return true;
+}
+
+void settings_companion_destroy() {
+  if (!g_companion_context) return;
+  ImGuiContext* main = ImGui::GetCurrentContext();
+  ImGuiContext* companion_context = g_companion_context;
+  g_companion_context = nullptr;
+  ImGui::DestroyContext(companion_context);
+  ImGui::SetCurrentContext(main == companion_context ? nullptr : main);
+}
+
+ImGuiContext* settings_companion_context() { return g_companion_context; }
+
+void settings_companion_request(int width, int height, float density, const ::companion::Touch* touches, size_t count) {
+  g_companion_request.on = g_companion_context && width > 0 && height > 0;
+  g_companion_request.width = width;
+  g_companion_request.height = height;
+  g_companion_request.density = density;
+  g_companion_request.touches.insert(g_companion_request.touches.end(), touches, touches + count);
+}
+
+bool settings_companion_built() { return g_companion_built; }
+
+void settings_companion_present(bool present) { g_companion_present = present && g_companion_context; }
+
+namespace {
+// With the main context current: switch to the companion's and start its frame (the touches, the
+// controller's keys when the panel has it, its size), then the rail. Returns its page.
+::companion::Begin companion_frame_begin(const NavFeed& nav, bool panel_opened) {
+  ImGui::SetCurrentContext(g_companion_context);
+  ImGuiIO& io = ImGui::GetIO();
+  const float scale = ::companion::ui_scale(g_companion_request.density);
+  io.DisplaySize = ImVec2(std::ceil(g_companion_request.width / scale - 0.001f), std::ceil(g_companion_request.height / scale - 0.001f));
+  io.DisplayFramebufferScale = ImVec2(scale, scale);
+  const double now = host::now_seconds();
+  io.DeltaTime = g_companion_time > 0.0 ? (float)std::clamp(now - g_companion_time, 0.001, 0.25) : 1.0f / 60.0f;
+  g_companion_time = now;
+  ::companion::feed_touches(g_companion_request.touches.data(), g_companion_request.touches.size(), scale);
+  g_companion_request.touches.clear();
+  io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+  io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+  if (nav.active) {
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  }
+  // Every frame, so a key let go while the panel lost the controller is let go here too.
+  io.AddKeyEvent(ImGuiKey_GamepadStart, nav.active && nav.start);
+  io.AddKeyEvent(ImGuiKey_GamepadBack, nav.active && nav.back);
+  io.AddKeyEvent(ImGuiKey_GamepadFaceDown, nav.active && nav.a);
+  io.AddKeyEvent(ImGuiKey_GamepadFaceRight, nav.active && nav.b);
+  io.AddKeyEvent(ImGuiKey_GamepadDpadUp, nav.active && nav.up);
+  io.AddKeyEvent(ImGuiKey_GamepadDpadDown, nav.active && nav.down);
+  io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, nav.active && nav.left);
+  io.AddKeyEvent(ImGuiKey_GamepadDpadRight, nav.active && nav.right);
+  ImGui::NewFrame();
+  return ::companion::begin(panel_opened);
+}
+}  // namespace
 
 // HDR10 paper white of the settings panel (0 on an SDR screen); set by the Direct3D 12 presenter.
 namespace { float g_settings_hdr_nits = 0.0f; }
@@ -5584,6 +5686,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (!phob_test_opened && state.open && phob_test && std::strcmp(phob_test, "panel") != 0) { phob_test_opened = true; phob_native_request(0); }  }
   if (!state.open && phob_native_open()) phob_native_close();
   // The PhobGCC menu reads the controller itself: the panel gets none of it.
+  NavFeed companion_nav;   // the same keys for the panel on a second screen (settings_companion_request)
   if (have_pad && nav_active && state.practice_pad_armed && phob_native_open()) {
     auto& io = ImGui::GetIO();
     for (ImGuiKey k : {ImGuiKey_GamepadStart, ImGuiKey_GamepadBack, ImGuiKey_GamepadFaceDown, ImGuiKey_GamepadFaceRight,
@@ -5593,6 +5696,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     auto& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    companion_nav = NavFeed{true, (pad.button & 0x1000) != 0, (pad.button & 0x10) != 0, (pad.button & 0x100) != 0, (pad.button & 0x200) != 0,
+                            (pad.button & 8) || pad.stick_y > 40, (pad.button & 4) || pad.stick_y < -40,
+                            (pad.button & 1) || pad.stick_x < -40, (pad.button & 2) || pad.stick_x > 40};
     io.AddKeyEvent(ImGuiKey_GamepadStart, (pad.button & 0x1000) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadBack, (pad.button & 0x10) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadFaceDown, (pad.button & 0x100) != 0);
@@ -6112,7 +6218,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // The Start that closed it must not reach the game (it would pause): hold the controllers until let go.
     if (pout.close_all) { phob_native_close(); state.open = false; state.practice_release_capture = true; }
   }
-  const bool panel_visible = (state.open || state.panel_slide_x > -720.0f) && !phob_native_open();
+  // A second screen (the companion) takes the panel off the game's picture: it is drawn there instead.
+  // companion_on: its frame is built now (at most 60 a second); the panel stays off the game's picture
+  // on every frame while the second screen is there, built or not.
+  const bool companion_on = g_companion_request.on && g_companion_context != nullptr;
+  g_companion_built = false;
+  const bool panel_visible = !g_companion_present && !companion_on && (state.open || state.panel_slide_x > -720.0f) && !phob_native_open();
   const bool practice_capture = state.practice_open || practice_force_capture ||
                                 state.practice_release_capture;
   host::window_input_capture(state.open || state.menu_open || practice_capture || replay_bar::wants_cursor() || arena_capture());
@@ -6139,7 +6250,26 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       changed = true;
     }
   }
-  if (panel_visible) {
+  ImGuiContext* const main_context = ImGui::GetCurrentContext();
+  bool companion_panel = false;
+  ImVec2 companion_panel_min, companion_panel_max;
+  if (companion_on) {
+    static bool panel_was_open = false;
+    const bool opened = state.open && !panel_was_open;
+    panel_was_open = state.open;
+    companion_nav.active = companion_nav.active && state.open && !phob_native_open();
+    const ::companion::Begin page = companion_frame_begin(companion_nav, opened);
+    companion_panel = page.page == ::companion::kSettings;
+    companion_panel_min = page.page_min;
+    companion_panel_max = page.page_max;
+  }
+  // The panel answers clicks only while it is open (its controls check state.open). On the second
+  // screen it is shown whether or not the controller opened it, so it counts as open while it is
+  // drawn there; the controller is taken from the game only when it really was opened (the capture
+  // above, and state.open as it was, put back after).
+  const bool open_before_companion = state.open;
+  if (companion_panel) state.open = true;
+  if (panel_visible || companion_panel) {
     g_settings_palette = options.overlay_palettes[std::clamp(options.overlay_style, 0, 6)];
     g_settings_custom_color_enabled = options.settings_custom_color_enabled;
     g_settings_custom_color = ImVec4(options.settings_custom_color[0],options.settings_custom_color[1],
@@ -6166,10 +6296,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(4.0f,2.0f));
       if (g_settings_classic_font) ImGui::PushFont(g_settings_classic_font);
     }
-    state.fill_window = g_fill_window.load(std::memory_order_relaxed) && test_menu_style() < 0;
+    state.fill_window = (companion_panel || g_fill_window.load(std::memory_order_relaxed)) && test_menu_style() < 0;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float motion_scale = std::max(0.1f, display.y / 480.0f);
-    if (state.fill_window) {
+    if (companion_panel) {
+      // The second screen: the page's area, beside the companion's rail, standing still. The Clean
+      // look's page slides in and fades up with clean_detail_frames, which only the overlay advances:
+      // here the page is always fully in.
+      state.clean_detail_frames = 14.0f;
+      ImGui::SetNextWindowPos(companion_panel_min);
+      ImGui::SetNextWindowSize(ImVec2(companion_panel_max.x - companion_panel_min.x, companion_panel_max.y - companion_panel_min.y));
+      ImGui::Begin("PC settings", nullptr,
+                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings);
+    } else if (state.fill_window) {
       ImGui::SetNextWindowPos(ImVec2(state.panel_slide_x * motion_scale, 0));
       ImGui::SetNextWindowSize(display);
       ImGui::Begin("PC settings", nullptr,
@@ -11586,6 +11726,36 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PopStyleVar(3);
       ImGui::PopStyleColor(10);
     }
+  }
+  if (companion_on) {
+    if (companion_panel) {
+      // Its Close (or B) shut it: the controller goes back to the game and the screen to its last page.
+      const bool closed = !state.open;
+      state.open = open_before_companion && !closed;
+      if (closed) ::companion::leave_settings();
+    }
+    // The companion's other pages, its frame done, and back to the game's own context.
+    const ::companion::Result r = ::companion::page(options);
+    if (r.tools_changed) { state.dirty = true; apply_practice_tools(options); }
+    if (r.options_changed) state.dirty = true;
+    ImGui::Render();
+    g_companion_built = true;
+    ImGui::SetCurrentContext(main_context);
+    // What the main screen reads of the panel's last frame is the main screen's own.
+    state.fill_window = g_fill_window.load(std::memory_order_relaxed) && test_menu_style() < 0;
+  }
+  g_companion_request.on = false;
+  // Development: the companion's pages beside the game in its own window, for a build without a second
+  // screen (MELEE_COMPANION_PREVIEW=1; the Settings page there is the panel as usual).
+  static const bool companion_preview = std::getenv("MELEE_COMPANION_PREVIEW") != nullptr && ::companion::available();
+  if (companion_preview && !companion_on) {
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const ImVec2 size(std::min(display.x * 0.45f, 620.0f), display.y);
+    ::companion::set_area(ImVec2(display.x - size.x, 0), size);
+    ::companion::begin(false);
+    const ::companion::Result r = ::companion::page(options);
+    if (r.tools_changed) { state.dirty = true; apply_practice_tools(options); }
+    if (r.options_changed) state.dirty = true;
   }
   // ---- the Esc menu ----
   if (state.menu_open && !state.open) {

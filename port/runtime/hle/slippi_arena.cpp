@@ -1,6 +1,9 @@
 // Arena rooms for Slippi Direct (see slippi_arena.h).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "slippi_arena.h"
+#ifdef __ANDROID__
+#include "android_second_screen.h"   // port/android: the viewer on the second screen
+#endif
 #include "arena_feed.h"
 #include "slippi_net.h"
 #include "slippi_online.h"
@@ -492,12 +495,21 @@ void host_message(Link& from, const std::vector<uint8_t>& m) {
 
 // ---- watching (any member who is not fighting) ----
 bool viewer_running() {
+#ifdef __ANDROID__
+  return g_viewer && android_host::viewer_running();   // a process of its own on the second screen
+#else
   DWORD code = 0;
   return g_viewer && GetExitCodeProcess(g_viewer, &code) && code == STILL_ACTIVE;
+#endif
 }
 
 void close_viewer() {
   if (!g_viewer) return;
+#ifdef __ANDROID__
+  android_host::viewer_close();
+  g_viewer = nullptr;
+  return;
+#endif
   DWORD code = 0;
   if (GetExitCodeProcess(g_viewer, &code) && code == STILL_ACTIVE) TerminateProcess(g_viewer, 0);   // the window we opened
   CloseHandle(g_viewer);

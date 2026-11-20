@@ -80,6 +80,10 @@ Status status();
 void toggle_pause();
 void seek_to(int32_t frame);
 void step_frame();               // paused: let one frame through
+// The companion's Replays page (gx/companion.h): the speed (0 = 0.25x, 1 = 0.5x, 2 = 1x) and fast forward.
+void set_speed_level(int index);
+void set_fast_forward(bool on);
+bool fast_forward_held();
 void set_ui_busy(bool busy);
 // The controller layer (gx/replay_hud.h) reads the pads itself: Start no longer pauses here.
 void set_pad_layer(bool on);

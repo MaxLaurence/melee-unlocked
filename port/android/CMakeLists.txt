@@ -114,7 +114,10 @@ endforeach()
 add_library(android_runtime STATIC ${ANDROID_RUNTIME_SOURCES} "${PORT}/third_party/slippilib/SlippiGame.cpp"
   "${COMPAT}/compat.cpp" "${COMPAT}/winhttp_ws.cpp" "${PORT}/linux/xinput_sdl.cpp" "${PORT}/linux/hid_linux.cpp"
   "${PORT}/linux/full/audio_sdl.cpp" "${PORT}/linux/full/linux_media.cpp" "${PORT}/linux/full/gpu_features_linux.cpp"
-  "${ANDROID_DIR}/gx_backend_android.cpp" "${ANDROID_DIR}/android_input.cpp")
+  "${ANDROID_DIR}/gx_backend_android.cpp" "${ANDROID_DIR}/android_input.cpp"
+  "${ANDROID_DIR}/android_second_screen.cpp"
+  # The companion's Replays and Online pages read recordings as the Windows launcher does.
+  "${PORT}/app/launcher_replay_data.cpp")
 target_compile_definitions(android_runtime PUBLIC MELEE_LINUX GX_PC_SETTINGS
   PRIVATE MELEE_PORT_VERSION="${MELEE_PORT_VERSION}" MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u
   GX_SHADER_CACHE_VERSION="android-vulkan-1")
@@ -126,6 +129,9 @@ target_compile_features(android_runtime PUBLIC cxx_std_17)
 # SDL's main macro stays out of the host's own code (main.cpp defines SDL_main itself), and the
 # <execinfo.h> shim (port/android/shim) comes before the NDK's for Android versions before 13.
 target_compile_definitions(android_runtime PUBLIC SDL_MAIN_HANDLED)
+# The companion on a handheld's second screen (runtime/gx/companion.h, BottomScreen.java).
+target_compile_definitions(android_runtime PUBLIC MELEE_COMPANION)
+target_include_directories(android_runtime PRIVATE "${PORT}/app")
 target_include_directories(android_runtime BEFORE PUBLIC "${ANDROID_DIR}/shim")
 target_compile_options(android_runtime PRIVATE ${MELEE_ANDROID_COMMON_FLAGS})
 foreach(lib avformat avcodec swscale swresample avutil curl ssl crypto)
