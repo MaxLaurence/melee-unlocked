@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "xinput.h"
 #include <SDL.h>
+#ifdef __ANDROID__
+#include "../android/android_input.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -105,6 +108,10 @@ DWORD XInputGetState(DWORD index, XINPUT_STATE* state) {
   g.sThumbLY = axis(p, SDL_CONTROLLER_AXIS_LEFTY, true);
   g.sThumbRX = axis(p, SDL_CONTROLLER_AXIS_RIGHTX, false);
   g.sThumbRY = axis(p, SDL_CONTROLLER_AXIS_RIGHTY, true);
+#ifdef __ANDROID__
+  // A handheld's own pad: its sticks unclipped and calibrated as slippi-android does (android_input.h).
+  android_host::builtin_sticks(s.vendor, s.product, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY);
+#endif
   if (std::memcmp(&g, &state->Gamepad, sizeof g) != 0) ++s.packet;
   state->dwPacketNumber = s.packet;
   state->Gamepad = g;

@@ -1,3 +1,73 @@
+# Mac app: Metal renderer, native on Apple silicon
+
+```sh
+port/mac/build-metal.sh /path/to/melee.iso            # Apple silicon (arm64, native)
+port/mac/build-metal.sh /path/to/melee.iso x86_64     # Intel Macs (also runs under Rosetta)
+```
+
+Needs the Xcode command line tools, CMake, Ninja, Python 3 and Docker Desktop (the game library is
+built by GCC 14 for Linux; GCC is required for `scalar_storage_order`). The result is
+`build-mac-<arch>/MeleeUnlocked.app`, ad-hoc signed. Opened from Finder it asks for the disc once and
+remembers it (`last-disc.txt`); settings, saves, replays and the shader cache live in
+`~/.local/share/melee-unlocked/User/Slippi`.
+
+**Rendering** is Metal (`renderer_metal.cpp`, `metal_device.mm`), implementing the same
+`linux_renderer` interface the OpenGL renderer does. The generated GX HLSL stays the one TEV/lighting
+implementation: glslang and SPIRV-Cross, linked into the program, turn it into MSL (`shader_msl.cpp`),
+cached on disk. Metal shares Direct3D's conventions, so viewport, depth and copy arithmetic is the
+Direct3D 11 backend's. MSAA, SSAA, the CRT model, sharpening, border art, video layers, texture packs
+and the ImGui settings panel (`pc_settings_metal.cpp`) are all on Metal. There is no OpenGL, Vulkan,
+Direct3D, DLSS, Reflex, XeSS, FSR or frame generation on the Mac.
+
+**Shaders** build on worker threads; a draw whose pipeline is not ready is skipped until it is. Every
+pipeline a run builds is recorded and built again before the next run's first frame, and the bundle
+carries a seed (`Resources/shader-seed`, made by `make_shader_seed.py` from hidden CPU matches on every
+stage with all 26 characters, the menus, Classic and the online screens: about 2,000 pipelines with
+their MSL), so a first launch builds those too, behind a progress bar: about 3 s on an M4 Max with
+nothing in macOS's own shader cache, about 0.1 s afterwards. `build-metal.sh` makes the seed once
+(`build-mac-gen/shader-seed`); `MELEE_SHADER_SEED=` (empty) turns it off for cold-cache checks.
+
+**Frame rate.** AppKit takes windows and their events only on the main thread, and the render thread
+(`gx/threaded_backend.cpp`) owns the window. So a launch with a window runs the game on a thread of its
+own and the render loop on the main thread (`main_thread.mm`): the same threads with the same jobs as on
+Windows and Linux, and the same presentation (display rate, sub-frame motion, frame cap). Hidden and
+headless runs keep one thread at 60 (`MELEE_MAC_ONE_THREAD=1` forces that for a windowed run too).
+
+**GameCube adapter**: libusb (the vendored 1.0.27, darwin backend), as Dolphin reads it on a Mac. Apple's
+HID driver takes the adapter unless [GCAdapterDriver](https://github.com/secretkeysio/GCAdapterDriver)
+is installed and allowed (System Settings > General > Login Items & Extensions > Driver Extensions);
+nothing is detached (that needs root). Close Dolphin or Slippi Dolphin first: one program at a time.
+
+**Media**: music packs (`<user>/MusicPacks`: mp3, wav, m4a, flac, ogg), video backgrounds (mp4) and
+pictures (png, jpg, bmp, webp) decode through the Linux code (`linux/full/linux_media.cpp`) with a
+static FFmpeg that `build-deps.sh` builds with only those formats.
+
+**Slippi**: the sign-in is read from Slippi Dolphin's folder
+(`~/Library/Application Support/com.project-slippi.dolphin/Slippi/user.json`, written when you log in
+through the Slippi Launcher) or the Launcher's own folder, as on Windows and Linux.
+
+**Apple silicon** cannot map anything below 4 GB, and the game keeps console addresses in 32-bit
+slots. So the console's address window starts at 1 TB there (`MU_WINDOW_BASE`,
+`sourceport/game/include/mu_disc.h`): slots keep the same low 32 bits as on the console and x86, and
+every conversion back to a pointer (`DP`, `MU_Z`, `MU_WINDOW`) adds the window. The game is a Linux
+AArch64 ELF (`-ffixed-x18 -fsigned-char`, x86's data alignment via `tools/align_like_x86.py`, its own
+printf family in `shim/mu_stdio_window.c`) whose code ships in a signed Mach-O container
+(`game_container.py`) so the kernel lets `elf_loader.cpp` map it executable at its window address.
+The host's fault handler puts the window back on a stray 32-bit pointer and logs `window: rebased`
+once per place (a bug to fix at its source; none are known).
+
+Checks:
+- On the scripted VS matches (`port/scripts/parity_vs*.txt`, `parity_lcancel.txt`) the arm64
+  simulation is bit-identical to the x86 build (7,200 match frames x 76 fields, 0 differences), which
+  in turn matches Windows.
+- Rollback netplay (`tools/p2p_pair.py`, loopback, no Slippi servers): arm64 against arm64 and arm64
+  against the x86 build, also with 40 ms lag, 8 ms jitter and 2% loss: every checksum agrees and both
+  sides record the same inputs.
+- Not yet checked on the Mac: a real GameCube adapter, a match through Slippi's matchmaking, and the
+  YouGame player box.
+
+---
+
 ## Staging agent-test variant
 
 `python3 -B port/mac/build_full.py --agent-test-hook` enables the staging-only

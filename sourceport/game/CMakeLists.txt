@@ -12,8 +12,25 @@ enable_testing()
 if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_VERSION VERSION_LESS 14)
   message(FATAL_ERROR "melee_game needs GCC 14 or newer: scalar_storage_order, and -ffp-contract=on meaning what the standard says")
 endif()
-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-  message(FATAL_ERROR "melee_game requires an x86-64 target")
+# arm64 macOS (port/mac): the same Linux ELF built for AArch64, its console window moved above 4 GB
+# (MU_WINDOW_BASE, include/mu_disc.h), since nothing may be mapped below 4 GB there.
+set(MU_WINDOW_BASE "" CACHE STRING "AArch64 only: the 4 GB-aligned address the console's address space starts at")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set(MU_ARM64 ON)
+  if(NOT MU_WINDOW_BASE OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "An AArch64 melee_game is the arm64 Mac's: build it for Linux with -DMU_WINDOW_BASE (port/mac/build-game.sh)")
+  endif()
+else()
+  set(MU_ARM64 OFF)
+endif()
+if(MU_ARM64)
+  # Static data aligned as x86-64 GCC aligns it (32 bytes for 32 and more): the DMA paths assert it
+  # (tools/align_like_x86.py, with -fdata-sections below). Every C object of this build goes through it.
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(CMAKE_C_COMPILER_LAUNCHER "${Python3_EXECUTABLE};${CMAKE_CURRENT_SOURCE_DIR}/../tools/align_like_x86.py")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64)$")
+  message(FATAL_ERROR "melee_game requires an x86-64 target (or AArch64 for the arm64 Mac)")
 endif()
 if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "melee_game supports Windows x64 and native Linux x86-64")
@@ -72,21 +89,40 @@ endif()
 target_compile_options(game_flags INTERFACE
   -O2 -g
   -include "${CMAKE_CURRENT_SOURCE_DIR}/include/mu_native.h"   # only C targets link game_flags
-  -mno-ms-bitfields          # the console compiler packs a u8 and a u16 bitfield into one run; the MS layout does not
   -fno-strict-aliasing       # the sources read floats through integer pointers throughout
   -fwrapv
   -fno-aggressive-loop-optimizations   # the sources read one entry past a table on a loop's last pass; GCC took that as proof the pass never runs and dropped it (Peach's third down special item)
   -fno-builtin               # no folding sin() at compile time or sqrt() into an instruction: the game's own maths decides
   -ffp-contract=on           # fuse a*b+c only inside one expression, as the console compiler did
-  -fexec-charset=CP932       # the game's string literals are Shift-JIS at run time
-  -w)
+  -fexec-charset=CP932)      # the game's string literals are Shift-JIS at run time
+# MU_CAST_AUDIT: warnings stay quiet except a 32-bit integer cast straight to a pointer, which skips
+# MU_Z and so the window base (include/mu_disc.h). An audit build, never a release.
+option(MU_CAST_AUDIT "Report narrowing integer-to-pointer casts instead of silencing warnings" OFF)
+if(MU_CAST_AUDIT)
+  target_compile_options(game_flags INTERFACE -Wno-all -Wno-extra -Wint-to-pointer-cast)
+else()
+  target_compile_options(game_flags INTERFACE -w)
+endif()
+if(MU_ARM64)
+  # The host is an Apple arm64 program, the game a Linux AArch64 ELF (port/mac/elf_loader.cpp): x18 is
+  # Apple's platform register, char stays signed as on x86-64 (the simulation was verified there),
+  # and atomics stay inline (the outline helpers read getauxval). Every call between the two passes
+  # only full-width integers, pointers and doubles, which both conventions pass alike.
+  target_compile_options(game_flags INTERFACE -ffixed-x18 -fsigned-char -mno-outline-atomics -fdata-sections)
+  target_compile_definitions(game_flags INTERFACE MU_WINDOW_BASE=${MU_WINDOW_BASE}ull)
+else()
+  target_compile_options(game_flags INTERFACE
+    -mno-ms-bitfields)         # the console compiler packs a u8 and a u16 bitfield into one run; the MS layout does not
+endif()
 # M0 evidence build only: counts non-finite inputs to the maths routines (include/mu_math_audit.h).
 option(MU_MATH_AUDIT "Count non-finite inputs to audited maths routines" OFF)
 if(MU_MATH_AUDIT)
   target_compile_definitions(game_flags INTERFACE MU_MATH_AUDIT)
 endif()
 set(MELEE_CPU_BASELINE "AVX2" CACHE STRING "Instruction set baseline, matching the host: AVX2, AVX or SSE2")
-if(MELEE_CPU_BASELINE STREQUAL "AVX2")
+if(MU_ARM64)
+  # AArch64 always has fused multiply-add, the instruction -ffp-contract=on needs (as AVX2's FMA on x86).
+elseif(MELEE_CPU_BASELINE STREQUAL "AVX2")
   target_compile_options(game_flags INTERFACE -mavx2 -mfma)
 elseif(MELEE_CPU_BASELINE STREQUAL "AVX")
   target_compile_options(game_flags INTERFACE -mavx)
@@ -415,15 +451,31 @@ endif()
 # globals stay private, its exports get the module's prefix, and its MexTK calls are renamed to the
 # decomp functions at the same console addresses (tools/tmce/link_module.py).
 set(TMCE "${CMAKE_CURRENT_SOURCE_DIR}/tmce")
+if(MU_ARM64)
+  # TM-CE names game data by console address; on arm64 those live inside the address window
+  # (tools/window_overlay.py rewrites a private copy, as the console-long overlay does for Linux).
+  file(GLOB_RECURSE MU_TMCE_INPUTS CONFIGURE_DEPENDS "${TMCE}/*")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MU_TMCE_INPUTS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/window_overlay.py")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/window_overlay.py"
+    "${TMCE}" "${CMAKE_CURRENT_BINARY_DIR}/tmce-window" --base ${MU_WINDOW_BASE} COMMAND_ERROR_IS_FATAL ANY)
+  set(TMCE "${CMAKE_CURRENT_BINARY_DIR}/tmce-window")
+endif()
 get_filename_component(TMCE_TOOLCHAIN_BIN "${CMAKE_C_COMPILER}" DIRECTORY)
 # No debug info: TM-CE declares types with the decomp's names (ColorOverlay, CollData...), and the
 # layout tools (tools/tmce/gdb_decomp_info.py) must find only the decomp's in melee_game.dbg.
-set(TMCE_FLAGS -O2 -g0 -funsigned-char -fno-strict-aliasing -fwrapv -mno-ms-bitfields -mcmodel=small
+set(TMCE_FLAGS -O2 -g0 -funsigned-char -fno-strict-aliasing -fwrapv -mcmodel=small
   -fno-builtin -ffp-contract=on -w)
+if(MU_ARM64)
+  list(APPEND TMCE_FLAGS -ffixed-x18 -mno-outline-atomics -fdata-sections -DMU_WINDOW_BASE=${MU_WINDOW_BASE}ull)
+else()
+  list(APPEND TMCE_FLAGS -mno-ms-bitfields)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   list(APPEND TMCE_FLAGS -fPIC -fvisibility=hidden -fno-tree-sra)
 endif()
-if(MELEE_CPU_BASELINE STREQUAL "AVX2")
+if(MU_ARM64)
+elseif(MELEE_CPU_BASELINE STREQUAL "AVX2")
   list(APPEND TMCE_FLAGS -mavx2 -mfma)
 elseif(MELEE_CPU_BASELINE STREQUAL "AVX")
   list(APPEND TMCE_FLAGS -mavx)
@@ -475,6 +527,10 @@ if(WIN32)
   target_link_options(melee_game PRIVATE -Wl,--image-base,0x82800000)
 else()
   target_link_libraries(melee_game PRIVATE m)
+  if(MU_ARM64)
+    # No libgcc_s import: the loader binds only the C library functions it lists.
+    target_link_options(melee_game PRIVATE -static-libgcc)
+  endif()
   set(MU_ELF_LAYOUT "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/game-linux-layout.ld")
   target_link_options(melee_game PRIVATE -Wl,-Ttext-segment=0x82800000 "-Wl,-T,${MU_ELF_LAYOUT}")
   set_property(TARGET melee_game APPEND PROPERTY LINK_DEPENDS "${MU_ELF_LAYOUT}")

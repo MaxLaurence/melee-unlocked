@@ -655,12 +655,23 @@ void syscall(Context& c, uint8_t* m) {
 }
 
 void update_mxcsr(Context& c) {
+#if defined(__aarch64__)
+  // The same two settings in the arm64 FPCR: RMode (bits 22-23: nearest, +inf, -inf, zero) and FZ.
+  uint64_t fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr &= ~((3ull << 22) | (1ull << 24));
+  static const uint64_t arm_rmode[4] = {0, 3, 1, 2};   // PPC RN: nearest, zero, +inf, -inf
+  fpcr |= arm_rmode[c.fpscr & 3] << 22;
+  if (c.fpscr & 4) fpcr |= 1ull << 24;
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#else
   unsigned csr = _mm_getcsr() & ~(0x6000u | 0x8000u | 0x0040u);
   unsigned rn = c.fpscr & 3;                      // PPC RN: 0 nearest,1 zero,2 +inf,3 -inf
   static const unsigned x86_rc[4] = {0x0000, 0x6000, 0x4000, 0x2000};
   csr |= x86_rc[rn];
   if (c.fpscr & 4) csr |= 0x8000u | 0x0040u;      // NI -> FTZ | DAZ, as Jit64 does
   _mm_setcsr(csr);
+#endif
 }
 
 void dcbz(Context& c, uint8_t* m, uint32_t ea) {

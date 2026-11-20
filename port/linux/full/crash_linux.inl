@@ -10,7 +10,7 @@
 #endif
 #include <fcntl.h>
 #include <unistd.h>
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__aarch64__)
 #include "../../mac/context_registers.h"
 #endif
 
@@ -104,7 +104,7 @@ static void linux_crash_signal(int sig, siginfo_t* si, void* uc_void) {
   if (g_linux_crash_entered) { signal(sig, SIG_DFL); raise(sig); return; }
   g_linux_crash_entered = 1;
   const ucontext_t* uc = static_cast<const ucontext_t*>(uc_void);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__aarch64__)
   const uintptr_t rip = uc ? (uintptr_t)mac_or_linux_rip(uc) : 0;
 #else
   const uintptr_t rip = uc ? (uintptr_t)uc->uc_mcontext.gregs[REG_RIP] : 0;

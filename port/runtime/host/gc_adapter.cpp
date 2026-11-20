@@ -1,8 +1,4 @@
 #include "test_env.h"
-#ifdef __APPLE__
-#include "host.h"
-#include "gc_adapter_mirror_mac.h"
-#else
 // Official / Mayflash / Hand Held Legend "GameCube Controller Adapter for Wii U", through libusb as
 // Dolphin uses it. Same protocol as Dolphin's GCAdapter: one 0x13 byte starts the 37-byte report
 // stream on endpoint 0x81 (status + 9 bytes per port), 0x11 + 4 bytes sets rumble.
@@ -30,6 +26,9 @@
 #include <tlhelp32.h>
 #include <hidsdi.h>
 #include <libusb.h>
+#ifdef __ANDROID__
+#include "../../android/android_input.h"
+#endif
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -462,6 +461,9 @@ void close_adapter(bool reset_transport = false) {
 #endif
     libusb_close(g_dev);
     g_dev = nullptr;
+#ifdef __ANDROID__
+    android_host::gc_adapter_close();   // the Java side's connection, and with it the descriptor
+#endif
   }
   g_claimed = false;
   if (g_hid != INVALID_HANDLE_VALUE) { CloseHandle(g_hid); g_hid = INVALID_HANDLE_VALUE; }
@@ -555,11 +557,90 @@ bool steam_is_running() {
   return found;
 }
 
+// The interrupt endpoint pair from the adapter's descriptors. An adapter whose interrupt endpoints
+// sit elsewhere still works; one we talk to on the wrong numbers does not.
+void read_endpoints(libusb_device* adapter) {
+  g_iface = 0; g_ep_in = 0x81; g_ep_out = 0x02;
+  libusb_config_descriptor* cfg = nullptr;
+  if (libusb_get_active_config_descriptor(adapter, &cfg) != 0 || !cfg) return;
+  bool found = false;
+  for (uint8_t i = 0; i < cfg->bNumInterfaces && !found; ++i) {
+    const libusb_interface& itf = cfg->interface[i];
+    for (int a = 0; a < itf.num_altsetting && !found; ++a) {
+      const libusb_interface_descriptor& alt = itf.altsetting[a];
+      uint8_t in = 0, out = 0;
+      for (uint8_t e = 0; e < alt.bNumEndpoints; ++e) {
+        const libusb_endpoint_descriptor& ep = alt.endpoint[e];
+        if ((ep.bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_INTERRUPT) continue;
+        if (ep.bEndpointAddress & 0x80) { if (!in) in = ep.bEndpointAddress; }
+        else if (!out) out = ep.bEndpointAddress;
+      }
+      if (in && out) { g_iface = alt.bInterfaceNumber; g_ep_in = in; g_ep_out = out; found = true; }
+    }
+  }
+  libusb_free_config_descriptor(cfg);
+  if (!found) log("gc adapter: no interrupt endpoint pair in the descriptors; trying the standard interface 0 with 0x81/0x02");
+}
+
+#ifdef __ANDROID__
+// Android: an app reaches a USB device only through Android's USB host API. MeleeActivity asks the
+// player (Android's own prompt, once per adapter), opens the adapter, claims it and hands its file
+// descriptor over; libusb then talks to it as on Linux, with no device discovery of its own.
+bool open_android() {
+  const int fd = android_host::gc_adapter_open();
+  if (fd < 0) {
+    set_problem("");
+    if (!g_logged_missing) {
+      log("gc adapter: none connected, or Android's permission not given yet; built-in and Bluetooth controllers stay active");
+      g_logged_missing = true;
+    }
+    return false;
+  }
+  if (!g_ctx) {
+    libusb_set_option(nullptr, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+    if (libusb_init(&g_ctx) != 0) {
+      g_ctx = nullptr;
+      android_host::gc_adapter_close();
+      if (!g_logged_missing) { log("gc adapter: libusb could not start"); g_logged_missing = true; }
+      return false;
+    }
+  }
+  int rc = libusb_wrap_sys_device(g_ctx, (intptr_t)fd, &g_dev);
+  if (rc != 0) {
+    g_dev = nullptr;
+    android_host::gc_adapter_close();
+    if (!g_logged_missing) { log("gc adapter: libusb could not take Android's connection (%s)", libusb_error_name(rc)); g_logged_missing = true; }
+    return false;
+  }
+  read_endpoints(libusb_get_device(g_dev));
+  // Already claimed on this descriptor by the Java side (which also took it from the kernel's HID
+  // driver); claiming again on the same descriptor succeeds and lets libusb know.
+  rc = libusb_claim_interface(g_dev, g_iface);
+  const int protocol = rc == 0 ? libusb_control_transfer(g_dev, 0x21, 11, 0x0001, 0, nullptr, 0, 1000) : 0;
+  if (protocol < 0 && protocol != LIBUSB_ERROR_PIPE)
+    log("gc adapter: report protocol request returned %s", libusb_error_name(protocol));
+  if (rc != 0) {
+    log("gc adapter: cannot claim the adapter (%s)", libusb_error_name(rc));
+    libusb_close(g_dev); g_dev = nullptr;
+    android_host::gc_adapter_close();
+    return false;
+  }
+  g_claimed = true;
+  set_problem("");
+  log("gc adapter: opened through Android's USB host (interface %d, endpoints in 0x%02X out 0x%02X)", g_iface, g_ep_in, g_ep_out);
+  start_threads();
+  return true;
+}
+#endif
+
 bool open_libusb() {
   if (!direct_adapter_allowed()) return false;
 #ifdef GC_ADAPTER_TEST_HOOK
   ++g_test_libusb_opens;
   return false;
+#endif
+#ifdef __ANDROID__
+  return open_android();
 #endif
   if (!g_ctx && libusb_init(&g_ctx) != 0) {
     if (!g_logged_missing) { log("gc adapter: libusb could not start; keyboard/XInput stay active"); g_logged_missing = true; }
@@ -581,32 +662,11 @@ bool open_libusb() {
     libusb_free_device_list(list, 1);
     return false;
   }
-  // Read the endpoint layout from the device before the list is freed. An adapter whose interrupt
-  // endpoints sit elsewhere still works; one we talk to on the wrong numbers does not.
-  g_iface = 0; g_ep_in = 0x81; g_ep_out = 0x02;
-  libusb_config_descriptor* cfg = nullptr;
-  if (libusb_get_active_config_descriptor(adapter, &cfg) == 0 && cfg) {
-    bool found = false;
-    for (uint8_t i = 0; i < cfg->bNumInterfaces && !found; ++i) {
-      const libusb_interface& itf = cfg->interface[i];
-      for (int a = 0; a < itf.num_altsetting && !found; ++a) {
-        const libusb_interface_descriptor& alt = itf.altsetting[a];
-        uint8_t in = 0, out = 0;
-        for (uint8_t e = 0; e < alt.bNumEndpoints; ++e) {
-          const libusb_endpoint_descriptor& ep = alt.endpoint[e];
-          if ((ep.bmAttributes & 0x03) != LIBUSB_TRANSFER_TYPE_INTERRUPT) continue;
-          if (ep.bEndpointAddress & 0x80) { if (!in) in = ep.bEndpointAddress; }
-          else if (!out) out = ep.bEndpointAddress;
-        }
-        if (in && out) { g_iface = alt.bInterfaceNumber; g_ep_in = in; g_ep_out = out; found = true; }
-      }
-    }
-    libusb_free_config_descriptor(cfg);
-    if (!found) log("gc adapter: no interrupt endpoint pair in the descriptors; trying the standard interface 0 with 0x81/0x02");
-  }
+  // The endpoint layout, read from the device before the list is freed.
+  read_endpoints(adapter);
   int rc = libusb_open(adapter, &g_dev);
   libusb_free_device_list(list, 1);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   // Linux: no access to the device node means the udev rule that gives the logged-in player the
   // adapter is not installed (or the adapter was plugged in before it was).
   if (rc == LIBUSB_ERROR_ACCESS) {
@@ -654,7 +714,7 @@ bool open_libusb() {
     }
     return false;
   }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   // The kernel's HID driver is let go first, as Dolphin does: the request below went to an adapter
   // the kernel still held (LIBUSB_ERROR_IO), and claiming detaches it only afterwards.
   if (libusb_kernel_driver_active(g_dev, g_iface) == 1) {
@@ -677,6 +737,20 @@ bool open_libusb() {
   rc = libusb_claim_interface(g_dev, g_iface);
 #endif
   if (rc != 0) {
+#ifdef __APPLE__
+    // macOS: the interface is held either by Apple's own HID driver (no GCAdapterDriver) or by
+    // another program that opened it through libusb (Dolphin, Slippi Dolphin).
+    set_problem(std::string("The game cannot read your GameCube adapter. Install GCAdapterDriver and allow it in System Settings > "
+                            "General > Login Items & Extensions > Driver Extensions, then replug the adapter; or, if it is installed, "
+                            "close Dolphin or Slippi Dolphin.") + kFrame1Note + " It is picked up without a restart.");
+    if (!g_logged_missing) {
+      log("gc adapter: cannot claim the adapter (%s): macOS's HID driver or another program (Dolphin?) holds it. GCAdapterDriver lets the game read it.",
+          libusb_error_name(rc));
+      g_logged_missing = true;
+    }
+    libusb_close(g_dev); g_dev = nullptr;
+    return false;
+#endif
     set_problem(std::string("Your GameCube adapter is in use by another program, such as Dolphin, so the game cannot read it. Close that program.")
                 + kFrame1Note + " It is picked up without a restart.");
     if (!g_logged_missing) {
@@ -1037,4 +1111,3 @@ int gcadapter_scope(int port, GCScopeSample* out, int max) {
 }
 
 }  // namespace host
-#endif

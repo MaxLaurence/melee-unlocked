@@ -127,6 +127,9 @@ constexpr bool kLabViewAvailable = true;
 #else
 #include "backends/imgui_impl_sdl2.h"
 #include <SDL.h>
+#ifdef __APPLE__
+#include <SDL_metal.h>
+#endif
 #endif
 #include <array>
 #include <functional>
@@ -2809,6 +2812,12 @@ bool settings_fills_window() { return g_fill_window.load(std::memory_order_relax
 // its own out from its height (game_ui_scale). g_frame_ui_scale is whichever the last frame used.
 std::atomic<float> g_window_scale{1.0f};
 std::atomic<float> g_frame_ui_scale{1.0f};
+// Pixels per unit of the pointer's position as the window reports it: 1, except on a Mac, where SDL
+// gives the window and the pointer in points and a Retina display has 2 pixels to the point.
+std::atomic<float> g_pointer_pixels{1.0f};
+#ifndef _WIN32
+SDL_Window* g_settings_sdl_window = nullptr;
+#endif
 ImVec2 g_frame_pixel_size(0, 0);   // the window's client area in pixels, before the division
 void settings_set_window_scale(float scale) {
   g_window_scale.store(std::clamp(scale, 1.0f, 4.0f), std::memory_order_relaxed);
@@ -3582,8 +3591,13 @@ void settings_context_create(void* window, bool open_at_startup) {
     g_input_overlay_style = legacy;
   }
 #ifndef _WIN32
+  g_settings_sdl_window = static_cast<SDL_Window*>(window);
+#ifdef __APPLE__
+  ImGui_ImplSDL2_InitForMetal(static_cast<SDL_Window*>(window));   // the Mac draws with Metal (port/mac)
+#else
   if (SDL_GetWindowFlags(static_cast<SDL_Window*>(window)) & SDL_WINDOW_VULKAN) ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
   else ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(window), SDL_GL_GetCurrentContext());
+#endif
   ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual, nullptr, 0);
   // The window code decides when the pointer shows (window_sdl.inl show_cursor). Without this the
   // SDL backend turned it back on every frame, so it never hid on Linux.
@@ -3591,10 +3605,13 @@ void settings_context_create(void* window, bool open_at_startup) {
   host::window_set_message_callback([](void* w, uint32_t m, uintptr_t, intptr_t) {
     if (m != host::kSdlEventMessage) return false;
     SDL_Event e = *static_cast<SDL_Event*>(w);
-    // The pointer arrives in pixels and a scaled frame is laid out in smaller units.
-    if (const float scale = g_frame_ui_scale.load(std::memory_order_relaxed); scale != 1.0f) {
-      if (e.type == SDL_MOUSEMOTION) { e.motion.x = (int)std::lround(e.motion.x / scale); e.motion.y = (int)std::lround(e.motion.y / scale); }
-      if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) { e.button.x = (int)std::lround(e.button.x / scale); e.button.y = (int)std::lround(e.button.y / scale); }
+    // The pointer arrives in the window's units (pixels; points on a Mac, g_pointer_pixels) and a
+    // scaled frame is laid out in smaller units.
+    const float scale = g_frame_ui_scale.load(std::memory_order_relaxed);
+    const float pixels = g_pointer_pixels.load(std::memory_order_relaxed);
+    if (scale != 1.0f || pixels != 1.0f) {
+      if (e.type == SDL_MOUSEMOTION) { e.motion.x = (int)std::lround(e.motion.x * pixels / scale); e.motion.y = (int)std::lround(e.motion.y * pixels / scale); }
+      if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) { e.button.x = (int)std::lround(e.button.x * pixels / scale); e.button.y = (int)std::lround(e.button.y * pixels / scale); }
     }
     ImGui_ImplSDL2_ProcessEvent(&e);
     return false;   // as on Windows: the window still sees every event
@@ -3618,6 +3635,9 @@ void settings_context_create(void* window, bool open_at_startup) {
 #endif
 
 void settings_context_destroy() {
+#ifndef _WIN32
+  g_settings_sdl_window = nullptr;
+#endif
   for (auto& preview : g_cosmetic_previews)
     if (preview.second) ImGui::UnregisterUserTexture(preview.second.get());
   g_cosmetic_previews.clear();
@@ -5458,6 +5478,22 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #else
   ImGui_ImplSDL2_NewFrame();
 #endif
+#ifdef __APPLE__
+  // The SDL backend gives the window in points, and its framebuffer scale from SDL_GL_GetDrawableSize,
+  // which a Metal window does not answer. Everything below works in pixels as Win32 gives them (the
+  // panels' pixel literals, the 1080-line scale, the game picture's placement), so the size is taken
+  // from the Metal drawable here and the pointer, also in points, is converted to match. Without
+  // this a Retina window drew the whole UI at half size in its top left quarter.
+  if (g_settings_sdl_window && !(SDL_GetWindowFlags(g_settings_sdl_window) & SDL_WINDOW_MINIMIZED)) {
+    int w = 0, h = 0, pw = 0, ph = 0;
+    SDL_GetWindowSize(g_settings_sdl_window, &w, &h);
+    SDL_Metal_GetDrawableSize(g_settings_sdl_window, &pw, &ph);
+    if (w > 0 && h > 0 && pw > 0 && ph > 0) {
+      ImGui::GetIO().DisplaySize = ImVec2(float(pw), float(ph));
+      g_pointer_pixels.store(float(ph) / float(h), std::memory_order_relaxed);
+    }
+  }
+#endif
   // The backend has just set the display size in pixels. On a scaled frame (the standalone settings
   // window on a scaled display, the game window above 1080 pixels high) lay it out in smaller units
   // instead and let the framebuffer scale draw it at full size (see g_frame_ui_scale). Rounded up so
@@ -7288,6 +7324,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Creating a device and a swapchain on another API means restarting; the choice is saved and
     // read again at the next launch (see load_pc_settings and --backend).
 #ifndef _WIN32
+#ifdef __APPLE__
+    ImGui::TextUnformatted("Graphics backend: Metal");   // the only one on the Mac (port/mac/renderer_metal.cpp)
+    if (false)
+#endif
     // Linux: OpenGL, or Vulkan where a Vulkan 1.3 GPU is present. Direct3D, DLSS and XeSS are Windows parts.
     {
       const char* linux_backends[] = {"OpenGL (default)", "Vulkan (experimental)"};

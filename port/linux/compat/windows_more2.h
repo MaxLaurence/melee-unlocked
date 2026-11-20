@@ -1,6 +1,7 @@
 // Linux build: process queries, waitable timers and string helpers (included by windows_more.h).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <cstdlib>   // getenv, setenv (glibc brings it in with other headers; bionic does not)
 
 typedef uint64_t ULONG64;
 typedef int64_t LONG64;
@@ -42,6 +43,7 @@ USHORT RtlCaptureStackBackTrace(ULONG skip, ULONG count, void** frames, ULONG* h
 // Cycles this thread has run, in TSC units like Windows (CPU time scaled by the measured TSC rate).
 BOOL QueryThreadCycleTime(HANDLE thread, ULONG64* cycles);
 
+#if defined(__x86_64__) || defined(__i386__)
 // MSVC's CPU feature intrinsics.
 #include <cpuid.h>
 #undef __cpuid
@@ -57,6 +59,7 @@ inline unsigned long long linux_xgetbv(unsigned index) {
 #endif
 #endif
 #define _xgetbv linux_xgetbv
+#endif
 #ifdef __APPLE__
 inline int _putenv_s(const char* name, const char* value) {
   if (!name || !value) return EINVAL;

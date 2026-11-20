@@ -62,4 +62,20 @@ void gcadapter_shutdown() {
   g_poll_rate_hz.store(0.0, std::memory_order_relaxed);
 }
 bool steam_running() { return false; }
+// PhobGCC settings and the scope menus read the adapter's raw reports, which the app's mirror does
+// not carry: the settings are kept (and saved) but shape nothing, and the scope stays empty.
+namespace { phob::Settings g_phob_settings[4]; }
+void gcadapter_phob_set(int port, const phob::Settings& settings) {
+  if (port < 0 || port > 3) return;
+  std::lock_guard<std::mutex> lock(g_app_mutex);
+  g_phob_settings[port] = settings;
+}
+phob::Settings gcadapter_phob_get(int port) {
+  if (port < 0 || port > 3) return {};
+  std::lock_guard<std::mutex> lock(g_app_mutex);
+  return g_phob_settings[port];
+}
+bool gcadapter_phob_raw(int, phob::HardwareInput&) { return false; }
+int gcadapter_scope(int, GCScopeSample*, int) { return 0; }
+void gcadapter_test_script_start() {}
 }

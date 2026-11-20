@@ -8,7 +8,9 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
+#if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#endif
 static inline unsigned char _BitScanForward64(unsigned long* index, unsigned long long value) {
   if (!value) return 0;
   *index = static_cast<unsigned long>(__builtin_ctzll(value));

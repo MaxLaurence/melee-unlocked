@@ -6,6 +6,14 @@
 
 namespace {
 SDL_Window* sdl_window() { return static_cast<SDL_Window*>(g_hwnd); }
+// The window's size in pixels: the Mac draws with Metal (port/mac/renderer_metal.cpp), Linux with OpenGL.
+void drawable_size(SDL_Window* window, int* w, int* h) {
+#ifdef __APPLE__
+  SDL_Metal_GetDrawableSize(window, w, h);
+#else
+  SDL_GL_GetDrawableSize(window, w, h);
+#endif
+}
 #ifdef MELEE_LINUX_X11_EMBED
 // Owned exclusively by the SDL video/render thread. The bridge only queues strings.
 yg_embed_x11* g_x11_embed = nullptr;
@@ -244,7 +252,7 @@ void handle_event(const SDL_Event& e) {
           if (g_x11_embed) return;  // The helper owns the native drawable dimensions.
 #endif
           int w = 0, h = 0;
-          SDL_GL_GetDrawableSize(sdl_window(), &w, &h);
+          drawable_size(sdl_window(), &w, &h);
           if (w > 0 && h > 0) {
             g_client_w = w; g_client_h = h;
             if (g_on_resize) g_on_resize(w, h);
@@ -300,6 +308,11 @@ void handle_event(const SDL_Event& e) {
           case SDL_SCANCODE_F1: (yougame::stdio_bridge() ? g_escape_press : g_settings_toggle).store(true); break;
 #endif
           case SDL_SCANCODE_F11: g_legacy_settings_toggle.store(true); break;
+#ifdef __ANDROID__
+          // A handheld's Back button (trapped from the activity, AndroidManifest.xml): the settings panel,
+          // as F1 on a keyboard; the panel reads the controller.
+          case SDL_SCANCODE_AC_BACK: g_settings_toggle.store(true); break;
+#endif
           case SDL_SCANCODE_F8: g_trace_mark.store(1); break;
           case SDL_SCANCODE_F6: g_trace_mark.store(2); break;
           case SDL_SCANCODE_F7: g_trace_mark.store(3); break;
@@ -327,6 +340,10 @@ void handle_event(const SDL_Event& e) {
 
 std::atomic<uint64_t> g_pending_client_size{0};
 bool g_fullscreen = false;
+#ifdef __APPLE__
+int g_fullscreen_retry = 0;              // 1: on, 2: off, asked again by window_pump (window_set_fullscreen)
+uint64_t g_fullscreen_retry_until = 0;
+#endif
 std::string utf8_title(const wchar_t* title) {
   std::string out;
   if (!title) return out;
@@ -396,13 +413,12 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
 #endif
   if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
     die("cannot start SDL video: %s", SDL_GetError());
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
 #ifdef __APPLE__
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+  // Metal: the renderer puts a CAMetalLayer view in the window (port/mac/metal_device.mm).
+  Uint32 flags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #else
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
-#endif
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
   SDL_GL_SetAttribute(SDL_GL_FRAMEBUFFER_SRGB_CAPABLE, 0);
@@ -410,6 +426,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   if (boxed) SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);  // Opaque child framebuffer.
 #endif
   Uint32 flags = (g_vulkan_window ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
 #ifdef MELEE_LINUX_X11_EMBED
   flags |= boxed ? SDL_WINDOW_HIDDEN : visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
 #else
@@ -450,7 +467,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   hidraw_start();
   g_closed = false;
   int dw = w, dh = h;
-  SDL_GL_GetDrawableSize(window, &dw, &dh);
+  drawable_size(window, &dw, &dh);
   g_client_w = dw > 0 ? dw : w; g_client_h = dh > 0 ? dh : h;
 #ifdef __APPLE__
   if (visible
@@ -481,9 +498,17 @@ void window_set_fullscreen(bool enabled) {
 #endif
   // Borderless at the desktop's own mode, as on Windows: no display mode change.
 #ifdef __APPLE__
-  if (SDL_SetWindowFullscreen(sdl_window(), enabled ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0)
+  if (SDL_SetWindowFullscreen(sdl_window(), enabled ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0) {
     g_fullscreen = enabled;
-  else host::log("window: fullscreen failed: %s", SDL_GetError());
+    g_fullscreen_retry = 0;
+  } else {
+    // macOS turns a change away while the window's previous full screen animation is still settling
+    // (a second toggle within a couple of seconds), and SDL then keeps its old state even when the
+    // window followed. window_pump asks again until the two agree.
+    g_fullscreen_retry = enabled ? 1 : 2;
+    g_fullscreen_retry_until = GetTickCount64() + 4000;
+    host::log("window: full screen %s did not finish; trying again", enabled ? "on" : "off");
+  }
 #else
   SDL_SetWindowFullscreen(sdl_window(), enabled ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
   g_fullscreen = enabled;
@@ -566,7 +591,7 @@ void window_presented(uint64_t frame) {
   }
 #endif
   if (at && frame >= at && frame <= at + 300 && (frame - at) % 30 == 0) {
-    int w = 0, h = 0; SDL_GL_GetDrawableSize(sdl_window(), &w, &h);
+    int w = 0, h = 0; drawable_size(sdl_window(), &w, &h);
     host::log("%s: frame %llu fullscreen=%d drawable=%dx%d", tag, (unsigned long long)frame, window_is_fullscreen(), w, h);
   }
 }
@@ -651,6 +676,24 @@ void window_pump() {
   pump_embed_commands();
   if (g_closed) return;
 #endif
+#ifdef __APPLE__
+  if (g_fullscreen_retry && g_hwnd) {
+    static uint64_t last_try = 0;
+    const uint64_t now = GetTickCount64();
+    const bool want = g_fullscreen_retry == 1;
+    if (now > g_fullscreen_retry_until) {
+      g_fullscreen_retry = 0;
+      host::log("window: full screen stayed %s", window_is_fullscreen() ? "on" : "off");
+    } else if (now - last_try >= 250) {
+      last_try = now;
+      if (SDL_SetWindowFullscreen(sdl_window(), want ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) == 0) {
+        g_fullscreen = want;
+        g_fullscreen_retry = 0;
+        host::log("window: full screen %s", want ? "on" : "off");
+      }
+    }
+  }
+#endif
   if (uint64_t want = g_pending_client_size.exchange(0))
     apply_client_size((int)(want >> 32), (int)(want & 0xFFFFFFFFu));
   {
@@ -690,6 +733,9 @@ void window_pump() {
 }
 
 void window_set_title(const wchar_t* title) {
+  // From the game's thread while the render thread runs the window (the texture prefetch's progress):
+  // shown by the window's thread at its next pump. macOS takes window calls only on its own thread.
+  if (g_hwnd && !on_window_thread()) { title_from_another_thread(utf8_title(title)); return; }
 #ifdef MELEE_LINUX_X11_EMBED
   // The loader can call from a worker. Keep all Xlib/SDL video calls on the window thread.
   if (window_embedded()) return;

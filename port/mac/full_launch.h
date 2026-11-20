@@ -3,6 +3,8 @@
 #pragma once
 #include "platform_paths.h"
 #include <cstdlib>
+#include <fstream>
+extern "C" bool mac_pick_iso(char* out, size_t capacity);   // iso_picker.mm
 #include <string>
 #include <vector>
 namespace mac_host {
@@ -39,6 +41,23 @@ inline std::vector<std::string> full_launch_arguments(int argc, char** argv) {
   default_path("--shader-cache", user / "shaders");
   default_path("--sys-dir", resources() / "Sys");
   fs::create_directories(user);
+  // Started from Finder (no --iso): the disc chosen last time, else a file panel (iso_picker.mm).
+  bool needs_disc = value("--iso").empty();
+  for (const char* tool : {"--version", "--help", "-h", "--settings-window", "--card-self-test", "--list-audio-devices"})
+    for (size_t i = 1; i < args.size(); ++i) if (args[i] == tool) needs_disc = false;
+  if (needs_disc) {
+    const fs::path remembered = user / "last-disc.txt";
+    std::string disc;
+    { std::ifstream in(remembered); std::getline(in, disc); }
+    std::error_code ec;
+    if (disc.empty() || !fs::is_regular_file(fs::u8path(disc), ec)) {
+      char picked[4096];
+      if (!mac_pick_iso(picked, sizeof picked)) std::exit(0);   // cancelled: nothing to play
+      disc = picked;
+      std::ofstream(remembered) << disc << '\n';
+    }
+    args.push_back("--iso"); args.push_back(disc);
+  }
   for (const auto& flag : {"--card-dir", "--replay-dir", "--shader-cache"}) fs::create_directories(value(flag));
   for (const auto& flag : {"--settings-path", "--log-file"}) fs::create_directories(fs::path(value(flag)).parent_path());
   // Relative diagnostic and auxiliary writes (including crash reports) belong to this profile.

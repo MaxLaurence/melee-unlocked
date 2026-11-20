@@ -18,6 +18,9 @@
 #else
 #include <openssl/evp.h>
 #endif
+#ifdef __ANDROID__
+#include "../../android/android_paths.h"
+#endif
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <iconv.h>
@@ -320,7 +323,9 @@ static BOOL create_process(const std::string& application, const std::string& co
   args[0] = program;
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
+#if !defined(__ANDROID__) || __ANDROID_API__ >= 34
   if (!directory.empty()) posix_spawn_file_actions_addchdir_np(&actions, directory.c_str());
+#endif
   if (startup && (startup->dwFlags & STARTF_USESTDHANDLES)) {
     auto dup_into = [&](HANDLE handle, int target) {
       auto* h = static_cast<Handle*>(handle);
@@ -397,6 +402,8 @@ DWORD GetModuleFileNameA(HMODULE module, LPSTR out, DWORD size) {
   if (!module) {
 #ifdef __APPLE__
     std::error_code ec; path = self_executable(ec).string();
+#elif defined(__ANDROID__)
+    path = android_host::program_path().string();   // app_process is the process's own program
 #else
     std::error_code ec; path = fs::read_symlink("/proc/self/exe", ec).string();
 #endif
@@ -437,6 +444,8 @@ HMODULE LoadLibraryA(LPCSTR name) {
     std::error_code ec;
 #ifdef __APPLE__
     const fs::path self = self_executable(ec);
+#elif defined(__ANDROID__)
+    const fs::path self = android_host::library_dir() / "libmain.so";
 #else
     const fs::path self = fs::read_symlink("/proc/self/exe", ec);
 #endif

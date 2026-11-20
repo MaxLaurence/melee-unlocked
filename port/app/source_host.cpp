@@ -14,14 +14,25 @@
 #endif
 #include "source_host.h"
 #include <windows.h>
+// The Mac and Android hosts map melee_game.so themselves (port/mac/elf_loader.cpp): no dynamic linker
+// of theirs can load a Linux ELF at the console addresses it was built for.
+#if defined(__APPLE__) || defined(__ANDROID__)
+#define MU_OWN_ELF_LOADER 1
+#else
+#define MU_OWN_ELF_LOADER 0
+#endif
 #ifdef _WIN32
 #include <shellapi.h>   // CommandLineToArgvW: an arena viewer's options
 #endif
 #ifndef _WIN32
 #include <dlfcn.h>
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__ANDROID__)
 #include "../mac/elf_loader.h"
+#ifdef __APPLE__
 #include "../mac/platform_paths.h"
+#else
+#include "../android/android_paths.h"
+#endif
 #include "../mac/context_registers.h"
 #include <csetjmp>
 #else
@@ -129,17 +140,25 @@ namespace gecko { extern int option_screen_shake_percent; extern bool option_no_
 namespace source_port {
 namespace {
 
-constexpr uintptr_t MEM1_BASE = 0x80000000u;
+// Where the console's address space starts in this process: zero everywhere but on Apple silicon,
+// which maps nothing below 4 GB and moves the whole window up (port/mac/elf_loader.h). The game's
+// 32-bit slots hold the same low 32 bits either way.
+#if MU_OWN_ELF_LOADER
+constexpr uintptr_t WINDOW_BASE = mac_elf::kWindowBase;
+#else
+constexpr uintptr_t WINDOW_BASE = 0;
+#endif
+constexpr uintptr_t MEM1_BASE = WINDOW_BASE + 0x80000000u;
 constexpr uint32_t MEM1_SIZE = 40u << 20;   // the console's 24 MB, grown for 8-byte pointers; the game image follows
-constexpr uintptr_t LOCKED_CACHE_BASE = 0xE0000000u;
+constexpr uintptr_t LOCKED_CACHE_BASE = WINDOW_BASE + 0xE0000000u;
 constexpr uint32_t LOCKED_CACHE_SIZE = 16u << 10;
 // Right after MEM1, so the game's own statics (the font atlas, static textures) have a physical
 // address the GX texture and display-list registers can hold: 26 bits, the first 64 MB.
-constexpr uintptr_t GAME_IMAGE_BASE = 0x82800000u;
+constexpr uintptr_t GAME_IMAGE_BASE = WINDOW_BASE + 0x82800000u;
 // The end of what GX can address: the game image must fit below it. The range itself is held from
 // startup by g_game_image_reservation (below); in the YouGame sandbox, with bottom-up ASLR on, the
 // process's early allocations (the GPU driver's among them) otherwise land anywhere in the low 4 GB.
-constexpr uintptr_t GAME_IMAGE_HOLD_END = 0x84000000u;
+constexpr uintptr_t GAME_IMAGE_HOLD_END = WINDOW_BASE + 0x84000000u;
 
 // The game library must load at GAME_IMAGE_BASE. Everything the host does before loading it (mod
 // scans, cosmetics, the music pack index) allocates, and a heap block placed there moved the library
@@ -149,7 +168,7 @@ struct GameImageReservation {
   void* base = nullptr;
   GameImageReservation() {
     // Generous: the image's own size is checked again after the load.
-#ifndef __APPLE__
+#if !MU_OWN_ELF_LOADER
     base = VirtualAlloc((void*)GAME_IMAGE_BASE, 0x04000000u, MEM_RESERVE, PAGE_NOACCESS);
 #endif
   }
@@ -161,11 +180,20 @@ struct GameImageReservation {
 GameImageReservation g_game_image_reservation;
 
 MuGameApi g_game{};
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
 mac_elf::Image g_mac_image;
 std::jmp_buf g_mac_run_boundary;
 bool g_mac_running = false;
+#if defined(__ANDROID__)
+// The plain ELF, installed as one of the app's native libraries (the one place an app may map code from).
+std::string g_dll = (android_host::library_dir() / "libmelee_game.so").string();
+#elif defined(__aarch64__)
+// The AArch64 ELF inside a signed Mach-O container (port/mac/game_container.py): Apple silicon runs
+// code only from signed pages.
+std::string g_dll = (mac_host::resources() / "melee_game.dylib").string();
+#else
 std::string g_dll = (mac_host::resources() / "melee_game.so").string();
+#endif
 #else
 #ifdef _WIN32
 // The compatibility build (melee_source_compat.exe) loads its own SSE2 game library, as on Linux.
@@ -1189,7 +1217,7 @@ template <class F> void guarded(F&& f) {
 #endif
     rollback_log(true);
     log_native_pose_bridge_stats();
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
     if (g_mac_running) std::longjmp(g_mac_run_boundary, 1);
 #endif
     if (g_shutdown) g_shutdown(stop.code);
@@ -1474,6 +1502,19 @@ void begin_native_savestates(int slots = slippi::ROLLBACK_MAX_FRAMES) {   // a r
   // ranges the build wrote beside the game library: a console savestate leaves all of it out, and
   // restoring its voice tables while the voices play on cuts and restarts sounds on every rollback.
   {
+#if MU_OWN_ELF_LOADER
+    // The Mac loads the ELF itself (no module handle): the ranges sit beside it in the bundle, and the
+    // size they were written for is the ELF's own (inside the arm64 container too).
+    const uintptr_t module = GAME_IMAGE_BASE;
+    {
+#ifdef __ANDROID__
+      const std::string path = (android_host::resources() / "melee_game.snapexcl").string();
+#else
+      const std::string path = (mac_host::resources() / "melee_game.snapexcl").string();
+#endif
+      std::ifstream in(path);
+      const unsigned long long dll_size = g_mac_image.elf_size();
+#else
     char dll_path[MAX_PATH] = {};
     HMODULE module = GetModuleHandleA(g_dll.c_str());
     if (module && GetModuleFileNameA(module, dll_path, MAX_PATH)) {
@@ -1486,6 +1527,7 @@ void begin_native_savestates(int slots = slippi::ROLLBACK_MAX_FRAMES) {   // a r
       WIN32_FILE_ATTRIBUTE_DATA dll_info{};
       const unsigned long long dll_size = GetFileAttributesExA(dll_path, GetFileExInfoStandard, &dll_info)
           ? ((unsigned long long)dll_info.nFileSizeHigh << 32 | dll_info.nFileSizeLow) : 0;
+#endif
       std::vector<MuStateRegion> sound;
       std::string line;
       size_t bytes = 0;
@@ -1908,8 +1950,9 @@ void plan_voice_banks(const uint8_t* p, std::vector<uint8_t>& reply) {
   }
 }
 
-int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t payload_size,
+int32_t h_slippi_command(uint32_t command_word, const uint8_t* payload, uint32_t payload_size,
                          uint8_t* response, uint32_t response_capacity, uint32_t* response_size) {
+  const uint8_t command = (uint8_t)command_word;
   return slippi::online::native_command(
       command, payload, payload_size, response, response_capacity, response_size,
       MU_SLIPPI_RESPONSE_CAPACITY, true,
@@ -2587,7 +2630,7 @@ void index_music_paths() {
     if (alias != g_view_alias.end() && alias->second > 0 && alias->second < (int32_t)g_fst.size())
       g_music_paths.try_emplace(g_fst[(size_t)alias->second].offset, relative);
   }
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
   // macOS: the program sits inside a signed, read-only .app bundle (the YouGame sandbox denies writes there and a
   // write would break the code seal), so music packs live in the player's user folder (--user-dir) instead.
   const auto& user = slippi::online::config().user_dir;
@@ -3237,7 +3280,7 @@ void write_replay_recording(bool) {}
 const MuReplayStart* h_replay_start() { return nullptr; }
 void h_replay_frame(int32_t, MuReplayFrame* out) { *out = MuReplayFrame{}; out->result = MU_REPLAY_TERMINATE; }
 int32_t h_replay_stock_steal(int32_t, int32_t) { return 0; }
-void h_replay_event(uint8_t, const uint8_t*, uint32_t) {}
+void h_replay_event(uint32_t, const uint8_t*, uint32_t) {}
 void h_replay_finished() {}
 #else
 // ---- --replay: Slippi replay playback (host API version 9) ----
@@ -3668,7 +3711,8 @@ int32_t h_replay_stock_steal(int32_t frame, int32_t port) {
   return g_replay->GetFrame(frame)->players.count((uint8_t)port) ? 1 : 0;
 }
 
-void h_replay_event(uint8_t command, const uint8_t* payload, uint32_t size) {
+void h_replay_event(uint32_t command_word, const uint8_t* payload, uint32_t size) {
+  const uint8_t command = (uint8_t)command_word;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   if (command == 0x36)
     g_agent_fight_match = !g_replaying && size >= 0x2F8 && (payload[0x1A3] == 0x08 || payload[0x2BD] != 0);
@@ -3844,10 +3888,65 @@ MuHostApi make_host() {
 // Linux: a fault inside the game logs its offset in melee_game.so (addr2line -e melee_game.dbg) and
 // keeps a --replay run's recording, then hands the signal on to the application's crash report.
 struct sigaction g_previous_crash_action[32];
+#if MU_OWN_ELF_LOADER && defined(__aarch64__)
+// Apple silicon's safety net for the address window (port/mac/elf_loader.h). The game keeps console
+// addresses in 32-bit slots and puts the window base back when it reads one; a path that misses that
+// (a struct read through the wrong type, say) hands a load or store an address below 4 GB, where
+// nothing is mapped. When such an address names memory inside the window, the faulting instruction's
+// base register gets the window bits it lacked and the instruction runs again: what the code meant.
+// Each place is reported once (async-signal-safe write) so it can be fixed at its source.
+void write_hex(char* out, uint64_t v) { for (int i = 15; i >= 0; --i, v >>= 4) out[i] = "0123456789ABCDEF"[v & 15]; }
+bool rebase_low_pointer(int sig, siginfo_t* si, void* uc_void) {
+  if ((sig != SIGSEGV && sig != SIGBUS) || !si || !uc_void) return false;
+#ifdef __APPLE__
+  auto& ss = static_cast<ucontext_t*>(uc_void)->uc_mcontext->__ss;
+  const uint64_t pc = ss.__pc, addr = (uint64_t)si->si_addr;
+  auto reg = [&](unsigned n) -> uint64_t& { return n == 29 ? ss.__fp : n == 30 ? ss.__lr : ss.__x[n]; };
+#else   // Android: Linux's AArch64 signal frame (x29 and x30 are regs[29] and regs[30])
+  auto& mc = static_cast<ucontext_t*>(uc_void)->uc_mcontext;
+  const uint64_t pc = mc.pc, addr = (uint64_t)si->si_addr;
+  auto reg = [&](unsigned n) -> uint64_t& { return reinterpret_cast<uint64_t&>(mc.regs[n]); };
+#endif
+  if (pc < GAME_IMAGE_BASE || pc >= GAME_IMAGE_BASE + host::game_image_size || (addr >> 32) || addr < 0x10000) return false;
+  const uint64_t fixed = WINDOW_BASE | addr;
+  const bool in_window = (fixed >= MEM1_BASE && fixed < GAME_IMAGE_HOLD_END) ||
+                         (fixed >= LOCKED_CACHE_BASE && fixed < LOCKED_CACHE_BASE + LOCKED_CACHE_SIZE);
+  if (!in_window) return false;
+  uint32_t insn;
+  std::memcpy(&insn, reinterpret_cast<const void*>(pc), 4);
+  if ((insn & 0x0A000000u) != 0x08000000u) return false;   // not a load or store
+  unsigned fixed_reg = 32;
+  const unsigned rn = (insn >> 5) & 31;
+  if (rn != 31 && reg(rn) && reg(rn) < 0x100000000ull) fixed_reg = rn;
+  else if ((insn & 0x3B200C00u) == 0x38200800u) {   // LDR/STR (register offset): the pointer may be Rm
+    const unsigned rm = (insn >> 16) & 31;
+    if (rm != 31 && reg(rm) && reg(rm) < 0x100000000ull) fixed_reg = rm;
+  }
+  if (fixed_reg == 32) return false;
+  reg(fixed_reg) |= WINDOW_BASE;
+  static std::atomic<uint64_t> reported[64];
+  for (auto& slot : reported) {
+    uint64_t seen = slot.load();
+    if (seen == pc) return true;
+    if (!seen && slot.compare_exchange_strong(seen, pc)) {
+      char line[] = "window: rebased a 32-bit pointer at melee_game.so+0x0000000000000000 (address 0x0000000000000000)\n";
+      write_hex(line + 52, pc - GAME_IMAGE_BASE);
+      write_hex(line + 80, addr);
+      (void)!write(2, line, sizeof line - 1);
+      return true;
+    }
+    if (slot.load() == pc) return true;
+  }
+  return true;
+}
+#endif
 void on_game_signal(int sig, siginfo_t* si, void* uc_void) {
+#if MU_OWN_ELF_LOADER && defined(__aarch64__)
+  if (rebase_low_pointer(sig, si, uc_void)) return;
+#endif
   const ucontext_t* uc = static_cast<const ucontext_t*>(uc_void);
   const uint64_t base = GAME_IMAGE_BASE, end = base + host::game_image_size;
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
   const uint64_t rip = uc ? mac_or_linux_rip(uc) : 0;
 #else
   const uint64_t rip = uc ? (uint64_t)uc->uc_mcontext.gregs[REG_RIP] : 0;
@@ -3855,7 +3954,7 @@ void on_game_signal(int sig, siginfo_t* si, void* uc_void) {
   if (rip >= base && rip < end) {
     write_replay_recording();
     host::log("game crash signal %d at melee_game.so+0x%llX, address %p", sig, (unsigned long long)(rip - base), si ? si->si_addr : nullptr);
-#ifndef __APPLE__
+#if !MU_OWN_ELF_LOADER
     host::log("  rax %016llX rbx %016llX rcx %016llX rdx %016llX", (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
               (unsigned long long)uc->uc_mcontext.gregs[REG_RBX], (unsigned long long)uc->uc_mcontext.gregs[REG_RCX],
               (unsigned long long)uc->uc_mcontext.gregs[REG_RDX]);
@@ -3863,7 +3962,9 @@ void on_game_signal(int sig, siginfo_t* si, void* uc_void) {
     // that point into the game, as the Windows leaf fallback reads them).
     const uint64_t* sp = (const uint64_t*)uc->uc_mcontext.gregs[REG_RSP];
 #else
-    const uint64_t* sp = (const uint64_t*)uc->uc_mcontext->__ss.__rsp;
+    const uint64_t* sp = (const uint64_t*)mac_stack_pointer(uc);
+    if (const uint64_t lr = mac_link_register(uc); lr > base && lr < end)
+      host::log("  link: melee_game.so+0x%llX", (unsigned long long)(lr - 4 - base));
 #endif
     for (int i = 0, shown = 0; i < 512 && shown < 24; ++i) {
       const uint64_t v = sp[i];
@@ -4309,7 +4410,7 @@ static FARPROC image_export(HMODULE module, const char* name) {
 bool reserve_memory() {
   // First, before anything else in the process can take the range: the game's 32-bit disc pointers
   // expect its memory where the console had it.
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
   std::string error;
   void* mem1 = mac_elf::activate_mem1(&error) ? (void*)MEM1_BASE : nullptr;
   if (!mem1) host::log("Mac memory: %s", error.c_str());
@@ -4442,7 +4543,7 @@ int run(void (*shutdown)(int)) {
 #endif
   ghost_ai::enable();   // the pro AI needs the game library's fighters: Source Port only
   practice_cpu::initialize_source_test_ghost();
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
   std::string mac_error;
   if (!g_mac_image.load(g_dll, &mac_error)) host::die("%s", mac_error.c_str());
   HMODULE module = (HMODULE)GAME_IMAGE_BASE;
@@ -4562,7 +4663,7 @@ int run(void (*shutdown)(int)) {
   slippi::arena::set_recording_codes(std::vector<uint8_t>(std::begin(native_online_recording_codes), std::end(native_online_recording_codes)));
   slippi::arena::set_viewer_launcher(launch_arena_viewer);
 #endif
-#ifdef __APPLE__
+#if MU_OWN_ELF_LOADER
   g_mac_running = true;
   if (setjmp(g_mac_run_boundary) == 0) guarded([&] { code = g_game.run(); });
   else code = g_exit_code;

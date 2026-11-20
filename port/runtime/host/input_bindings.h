@@ -162,6 +162,10 @@ inline std::array<PadBindings, 4> default_pad_bindings() {
     p.mask[(size_t)BindAction::RAnalog] = kXInputBindRT;
     p.mask[(size_t)BindAction::L]      = kXInputBindLT;
     p.mask[(size_t)BindAction::R]      = kXInputBindRT;
+#ifdef __ANDROID__
+    // A handheld's L1 is a full L press too, as slippi-android maps the Thor (L1 and L2 both L, R1 Z).
+    p.mask[(size_t)BindAction::L]     |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+#endif
   }
   return pads;
 }

@@ -20,13 +20,30 @@ typedef __UINTPTR_TYPE__ mu_uptr;
 #define DISC_STRUCT __attribute__((scalar_storage_order("big-endian")))
 
 /* A pointer slot inside disc data. The archive loader relocates it to a real address, and MEM1 and
- * the game image both sit below 4 GB so that address fits. It is a union on purpose: using one as if
+ * the game image both sit in one 4 GB window (MU_WINDOW_BASE below) so that address fits. It is a union on purpose: using one as if
  * it were a pointer is a compile error rather than a truncation, and the zero-length member carries
  * the pointed-to type so DP() can hand back a typed pointer (it adds no size, and packed/aligned(4)
  * keep it from raising the slot's alignment to 8). */
 #define DISC_PTR(T) union __attribute__((packed, aligned(4), scalar_storage_order("big-endian"))) { mu_u32 raw; T* type_[0]; }
-#define DP(slot) ((__typeof__((slot).type_[0])) (mu_uptr) (slot).raw)
-#define DISC_GET(T, slot) ((T*) (mu_uptr) (slot).raw)
+
+/* Where the console's 4 GB address space sits in this process. Zero on x86-64, where MEM1 is at
+ * 0x80000000 and the game image follows it. On arm64 macOS nothing may be mapped below 4 GB, so the
+ * whole window moves up to MU_WINDOW_BASE (4 GB aligned, set by the build): a slot still holds the
+ * address's low 32 bits, the very number the console and the x86 build store, and reading one puts
+ * the window back on top. Zero stays a null pointer. */
+#ifndef MU_WINDOW_BASE
+#define MU_WINDOW_BASE 0
+#endif
+#if MU_WINDOW_BASE
+static inline mu_uptr mu_widen32(mu_u32 value)
+{
+    return value ? ((mu_uptr) MU_WINDOW_BASE | value) : 0;
+}
+#else
+#define mu_widen32(value) ((mu_uptr) (mu_u32) (value))   /* a constant expression, as it always was */
+#endif
+#define DP(slot) ((__typeof__((slot).type_[0])) mu_widen32((slot).raw))
+#define DISC_GET(T, slot) ((T*) mu_widen32((slot).raw))
 #define DISC_SET(slot, ptr) ((slot).raw = mu_addr32(ptr))
 #define DISC_NULL(slot) ((slot).raw == 0)
 /* A slot the decompilation types as a pointer (UNK_T) but the game uses as a 32-bit number. */
@@ -44,7 +61,7 @@ static inline mu_u32 mu_addr32_checked(const void* ptr, const char* file, int li
 {
     mu_uptr value = (mu_uptr) ptr;
 #ifndef NDEBUG
-    if (value >> 32) {
+    if (value && (value >> 32) != ((mu_uptr) MU_WINDOW_BASE >> 32)) {
         mu_addr32_failed(ptr, file, line);
     }
 #endif
@@ -55,7 +72,11 @@ static inline mu_u32 mu_addr32_checked(const void* ptr, const char* file, int li
 /* A 32-bit word that holds an address, widened for a cast to a pointer. The game keeps addresses in
  * s32 and int words all over; they all have bit 31 set here, and a signed word would come back
  * sign-extended. tools/cast_census.py --fix puts this on every narrow int-to-pointer cast. */
-#define MU_Z(x) ((mu_uptr) (mu_u32) (x))
+#define MU_Z(x) mu_widen32((mu_u32) (x))
+/* A console address the game writes as a number (0x80000000, an arena bound) as a pointer here. */
+#define MU_WINDOW(addr) ((void*) mu_widen32((mu_u32) (addr)))
+/* The same for a nonzero constant, as a constant expression (static initialisers). */
+#define MU_WINDOW_CONST(addr) ((void*) ((mu_uptr) MU_WINDOW_BASE | (mu_u32) (addr)))
 #define MU_ADDR32(ptr) mu_addr32(ptr)
 
 /* Elements of a scalar array reached through a pointer: f32* weights becomes be_f32* weights. */

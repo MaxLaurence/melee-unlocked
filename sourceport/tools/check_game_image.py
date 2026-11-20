@@ -10,8 +10,8 @@ def image_range(data: bytes) -> tuple[int, int]:
         if data[4:6] != b'\x02\x01':
             raise ValueError('the native game must be a little-endian ELF64 library')
         header = struct.unpack_from('<16sHHIQQQIHHHHHH', data)
-        if header[1:3] != (3, 62):
-            raise ValueError('the native game must be an x86-64 ELF shared object')
+        if header[1] != 3 or header[2] not in (62, 183):
+            raise ValueError('the native game must be an x86-64 (or, for the arm64 Mac, AArch64) ELF shared object')
         phoff, phentsize, phnum = header[5], header[9], header[10]
         if phentsize < 56:
             raise ValueError('invalid ELF program header size')

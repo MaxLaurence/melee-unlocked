@@ -4,7 +4,13 @@
 
 /* A pointer slot in disc data (a .dat file): 4 bytes holding the real address, which sits below
  * 4 GB natively (MEM1 and the game image). */
+#ifdef MU_WINDOW_BASE
+/* arm64 Mac: console addresses live in a window above 4 GB (include/mu_disc.h). */
+#define MEX_DP(slot) ({ unsigned int mex_dp_ = (unsigned int)(slot); \
+                        (void *)(mex_dp_ ? ((uintptr_t)MU_WINDOW_BASE | mex_dp_) : 0); })
+#else
 #define MEX_DP(slot) ((void *)(uintptr_t)(unsigned int)(slot))
+#endif
 
 /* C library functions MexTK declares with the console int sizes: natively they go to wrappers
  * (native/tmce_runtime.c), so a 32-bit size never lands in a 64-bit size_t parameter. */

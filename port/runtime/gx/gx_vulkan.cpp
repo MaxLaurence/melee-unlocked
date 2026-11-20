@@ -89,6 +89,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __ANDROID__
+// port/android/shader_spirv.cpp: HLSL to SPIR-V with glslang in the program.
+std::vector<uint32_t> android_hlsl_spirv(const std::string& hlsl, bool vertex, const char* entry, int texture_shift,
+                                         int sampler_shift, bool invert_y, std::string* error);
+#endif
 namespace gx {
 #if defined(__linux__)
 // gx_dxc_linux.cpp: DXC from libdxcompiler.so, the same compiler and arguments as Windows.
@@ -250,6 +255,12 @@ std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::st
   std::memcpy(words.data(), object->GetBufferPointer(), object->GetBufferSize());
   return words;
 }
+#elif defined(__ANDROID__)
+// Android: glslang as a library (port/android/shader_spirv.cpp), with glslangValidator's arguments below:
+// an app cannot start a program of its own.
+std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::string* error, const char* entry = "main", bool present = false) {
+  return ::android_hlsl_spirv(hlsl, vertex, entry, present ? 1 : 2, present ? 5 : 3, present && vertex, error);
+}
 #else
 std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::string* error, const char* entry = "main", bool present = false) {
 #if defined(__linux__)
@@ -302,6 +313,9 @@ std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::st
 // SPIR-V for one HLSL source, from the disk cache when it was compiled before.
 uint64_t spirv_hash(const std::string& hlsl, bool vertex, const char* entry = "main", bool present = false) {
   uint64_t hash = hash_bytes(hlsl.data(), hlsl.size()) ^ (vertex ? 0x5653ull : 0x5053ull);
+#ifdef __ANDROID__
+  hash ^= 0x676C736C616E6702ull;   // glslang's SPIR-V (port/android/shader_spirv.cpp); bump when it changes
+#endif
   return hash ^ (hash_bytes(entry, std::strlen(entry)) * 31 + (present ? 0x7071ull : 0));
 }
 std::filesystem::path spirv_path(uint64_t hash, bool vertex) {
@@ -1251,11 +1265,53 @@ class VulkanBackend final : public Backend {
     throw std::runtime_error("vulkan: the driver could not map a host-visible buffer");
   }
 
+#ifdef __ANDROID__
+  // Android takes the window's surface away while the app is in the background and gives a new one
+  // when it returns: the swapchain and the Vulkan surface are made again on the new one. Until then
+  // (no surface yet) the frame is skipped and this is tried again on the next.
+  bool surface_lost_ = false;
+  bool replace_surface() {
+    destroy_swapchain();
+    if (surface_) { vkDestroySurfaceKHR(instance_, surface_, nullptr); surface_ = VK_NULL_HANDLE; }
+    if (!window_.create_surface || !window_.create_surface(instance_, &surface_)) { surface_ = VK_NULL_HANDLE; return false; }
+    surface_lost_ = false;
+    host::log("vulkan: the window's surface was replaced (the app came back to the front)");
+    return true;
+  }
+  static bool surface_gone(VkResult r) { return r == VK_ERROR_SURFACE_LOST_KHR || r == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR; }
+#endif
+
   void create_swapchain() {
     if (window_.drawable_size) window_.drawable_size(&client_w_, &client_h_);
+#ifdef __ANDROID__
+    if ((surface_lost_ || !surface_) && !replace_surface()) { swapchain_dirty_ = true; return; }
+    VkSurfaceCapabilitiesKHR caps;
+    if (const VkResult got = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps); surface_gone(got)) {
+      surface_lost_ = true; swapchain_dirty_ = true; return;
+    } else check(got, "surface capabilities");
+#else
     VkSurfaceCapabilitiesKHR caps; check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps), "surface capabilities");
+#endif
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == 0xFFFFFFFFu) extent = {(uint32_t)client_w_, (uint32_t)client_h_};
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+#ifdef __ANDROID__
+    // Android gives the surface in the panel's own orientation, with the turn the display applies to
+    // it (a handheld's portrait panel held in landscape: 90 or 270 degrees). The frame is drawn
+    // upright at the window's size and the compositor turns it, with no transform of ours.
+    {
+      static VkExtent2D logged{};
+      if (logged.width != caps.currentExtent.width || logged.height != caps.currentExtent.height) {
+        logged = caps.currentExtent;
+        host::log("vulkan: surface %ux%u, transform 0x%x (supported 0x%x), window %dx%d", caps.currentExtent.width,
+                  caps.currentExtent.height, (unsigned)caps.currentTransform, (unsigned)caps.supportedTransforms, client_w_, client_h_);
+      }
+    }
+    if (client_w_ > 0 && client_h_ > 0) extent = {(uint32_t)client_w_, (uint32_t)client_h_};
+    else if (transform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR))
+      std::swap(extent.width, extent.height);
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+#endif
     extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
     extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
     if (!extent.width || !extent.height) { swapchain_dirty_ = true; return; }   // minimized: try again later
@@ -1306,7 +1362,7 @@ class VulkanBackend final : public Backend {
     if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
     info.imageFormat = format.format; info.imageColorSpace = format.colorSpace; info.imageExtent = extent;
     info.imageArrayLayers = 1; info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; info.preTransform = caps.currentTransform;
+    info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE; info.preTransform = transform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR; info.presentMode = present_mode_; info.clipped = VK_TRUE;
     info.oldSwapchain = swapchain_;
     VkSwapchainKHR created = VK_NULL_HANDLE;
@@ -1319,6 +1375,9 @@ class VulkanBackend final : public Backend {
       host::log("vulkan: render latency readout off (the swapchain refused it: %d)", (int)made);
       made = vkCreateSwapchainKHR(device_, &info, nullptr, &created);
     }
+#ifdef __ANDROID__
+    if (surface_gone(made)) { surface_lost_ = true; swapchain_dirty_ = true; return; }
+#endif
     check(made, "swapchain");
     if (low_latency_on_) {
       // Reports only: the low-latency sleep stays off, so pacing is exactly as without it.
@@ -1710,6 +1769,9 @@ class VulkanBackend final : public Backend {
       stat_present_ += present_end - present_call; ++stat_frames_;
       if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { present_id_ = id; if (present_id_on_) last_present_id_ = id; }
       if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || exclusive_lost(r)) swapchain_dirty_ = true;
+#ifdef __ANDROID__
+      else if (surface_gone(r)) { surface_lost_ = true; swapchain_dirty_ = true; }
+#endif
       else if (r != VK_SUCCESS) check(r, "present");
       ++presented_;
       if ((presented_ & 31) == 0) update_variable_refresh();
@@ -2414,6 +2476,9 @@ class VulkanBackend final : public Backend {
     const VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &image_index_);
     acquire_wait_ = host::now_seconds() - acquire_start;
     if (r == VK_ERROR_OUT_OF_DATE_KHR || exclusive_lost(r)) { swapchain_dirty_ = true; return; }
+#ifdef __ANDROID__
+    if (surface_gone(r)) { surface_lost_ = true; swapchain_dirty_ = true; return; }
+#endif
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) check(r, "acquire");
     if (r == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
     acquired_ = true;

@@ -70,6 +70,15 @@ inline std::vector<std::filesystem::path> launcher_roots() {
       if (*value) roots.emplace_back(std::filesystem::path(value) / "Slippi Launcher");
 #endif
   }
+#ifdef __APPLE__
+  // macOS: Slippi Dolphin's own user folder (Slippi/user.json directly under it, where the Launcher's
+  // sign-in writes it), then the Launcher's folder, both in Application Support.
+  if (const char* home = std::getenv("HOME"); home && *home) {
+    const auto support = std::filesystem::path(home) / "Library" / "Application Support";
+    roots.emplace_back(support / "com.project-slippi.dolphin");
+    roots.emplace_back(support / "Slippi Launcher");
+  }
+#endif
 #ifndef _WIN32
   // Linux: the Slippi Launcher (an Electron app) keeps its folder under the XDG config home, and
   // the Flatpak build inside its own sandbox folder.

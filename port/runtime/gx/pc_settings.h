@@ -93,4 +93,18 @@ public:
   void draw();
 };
 #endif
+#ifdef __APPLE__
+// macOS: the same panel drawn with Metal into the window's drawable (port/mac/pc_settings_metal.cpp).
+// metal_device is the renderer's id<MTLDevice>; draw() takes the present pass's command buffer,
+// render encoder and pass descriptor.
+class PcSettingsUIMetal {
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+public:
+  PcSettingsUIMetal(void* window, void* metal_device, const RenderOptions& options);
+  ~PcSettingsUIMetal();
+  bool begin(RenderOptions& options);
+  void draw(void* command_buffer, void* encoder, void* pass_descriptor);
+};
+#endif
 }

@@ -62,6 +62,7 @@
 #endif
 #ifdef __APPLE__
 #include <SDL_syswm.h>
+#include <SDL_metal.h>
 extern "C" bool mac_window_is_fullscreen(void*);
 extern "C" void mac_toggle_fullscreen(void*);
 #endif

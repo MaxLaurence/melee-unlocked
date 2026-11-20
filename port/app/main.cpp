@@ -1336,16 +1336,21 @@ static void remember_iso(const std::string& iso) {
 #endif
 #ifdef __APPLE__
 #include "../mac/cpu_check.h"
+#include "../mac/main_thread.h"
 #endif
 static bool cpu_has_avx2() {
 #ifdef __APPLE__
   return mac_host::cpu_ok();
+#elif defined(__aarch64__)
+  return true;   // Android: every arm64 processor has the fused multiply-add the simulation needs
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
   int r[4];
   __cpuid(r, 0); if (r[0] < 7) return false;
   __cpuid(r, 1); const bool osxsave = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1;
   if (!osxsave || !avx || (_xgetbv(0) & 6) != 6) return false;
   __cpuidex(r, 7, 0); return (r[1] >> 5) & 1;
+#endif
 }
 
 // ...and the check in melee_main is too late to catch it. The runtime and guest libraries are built
@@ -1618,6 +1623,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #include "../mac/full_launch.h"
 int main(int argc, char** argv) {
   auto args = mac_host::full_launch_arguments(argc, argv);
+  std::vector<char*> pointers;
+  for (auto& arg : args) pointers.push_back(arg.data());
+  pointers.push_back(nullptr);
+  if (mac_host::wants_game_thread(args)) return mac_host::run_game_on_own_thread(guarded_main, (int)args.size(), pointers.data());
+  return guarded_main((int)args.size(), pointers.data());
+}
+#elif defined(__ANDROID__)
+#include "../android/android_launch.h"
+// SDL's Java activity (port/android/java MeleeActivity) loads libmain.so and calls this on its own thread.
+extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char** argv) {
+  auto args = android_host::launch_arguments(argc, argv);
   std::vector<char*> pointers;
   for (auto& arg : args) pointers.push_back(arg.data());
   pointers.push_back(nullptr);
@@ -2407,8 +2423,10 @@ static int melee_main(int argc, char** argv) {
   // Embedded launch belongs to YouGame, including when --fullscreen is also supplied.
   // Decide before hiding a regular fullscreen launch; the panel still needs permission to show.
   if (yougame::embedded()) gfx.fullscreen = false;
-  // Accept --threaded-renderer from the desktop launch spec. AppKit requires the main thread.
-  threaded = false;
+  // A launch with a window runs the game on its own thread and the render loop on the main thread,
+  // where AppKit needs the window (port/mac/main_thread.h), so it always draws on the render thread
+  // and the frame rate is the player's. A hidden or headless launch keeps one thread, at 60.
+  threaded = mac_host::game_thread_active() && !headless;
   if (automated || scripted) {
     gfx.slippi_spectator = false;
     gx::RenderOptions::live_slippi_spectator() = false;
@@ -2420,7 +2438,12 @@ static int melee_main(int argc, char** argv) {
   // threaded renderer (every normal launch) makes its window too, and without this a Linux Vulkan
   // choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
   if (!headless) {
+#ifdef __ANDROID__
+    gfx.api = gx::RenderApi::Vulkan;   // Android's one renderer (port/android/gx_backend_android.cpp)
+    if (false) {
+#else
     if (gfx.api == gx::RenderApi::Vulkan && !gx::vulkan_available()) {
+#endif
       host::log("vulkan: not usable on this system; starting on the default renderer");
       gfx.api = gx::RenderApi::D3D12;
     }
@@ -2432,7 +2455,11 @@ static int melee_main(int argc, char** argv) {
     constexpr int vulkan_failure_limit = 2;
 #endif
     gx::vulkan_set_shader_cache(gfx.shader_cache);   // the start marker lives in the cache folder
+#ifdef __ANDROID__
+    if (false) {   // Vulkan is Android's only renderer: nothing to fall back to
+#else
     if (gfx.api == gx::RenderApi::Vulkan && gx::vulkan_failed_starts() >= vulkan_failure_limit) {
+#endif
       host::log("vulkan: the last %d starts did not finish; starting on the default renderer (pick Vulkan in the settings to try it again)",
                 gx::vulkan_failed_starts());
       gfx.api = gx::RenderApi::D3D12;

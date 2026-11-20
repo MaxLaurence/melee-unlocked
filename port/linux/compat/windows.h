@@ -18,7 +18,18 @@
 #include <cerrno>
 #include <climits>
 #include <unistd.h>
+#if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#else
+// arm64 (the native Mac build): the time-stamp counter is the generic timer's virtual count. Callers
+// only take differences and calibrate them against a clock, as they do the x86 TSC.
+inline unsigned long long __rdtsc() { unsigned long long v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+// The rotates x86intrin.h declares.
+inline unsigned int _rotl(unsigned int v, int s) { s &= 31; return s ? (v << s) | (v >> (32 - s)) : v; }
+inline unsigned int _rotr(unsigned int v, int s) { s &= 31; return s ? (v >> s) | (v << (32 - s)) : v; }
+inline unsigned long long _rotl64(unsigned long long v, int s) { s &= 63; return s ? (v << s) | (v >> (64 - s)) : v; }
+inline unsigned long long _rotr64(unsigned long long v, int s) { s &= 63; return s ? (v >> s) | (v << (64 - s)) : v; }
+#endif
 
 #define WINAPI
 #define CALLBACK
@@ -218,7 +229,11 @@ inline LONG InterlockedDecrement(volatile LONG* v) { return __atomic_sub_fetch(v
 inline LONG InterlockedExchange(volatile LONG* v, LONG x) { return __atomic_exchange_n(v, x, __ATOMIC_SEQ_CST); }
 inline LONG InterlockedCompareExchange(volatile LONG* v, LONG x, LONG cmp) {
   __atomic_compare_exchange_n(v, &cmp, x, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return cmp; }
+#if defined(__x86_64__) || defined(__i386__)
 inline void YieldProcessor() { _mm_pause(); }
+#else
+inline void YieldProcessor() { __asm__ volatile("yield"); }
+#endif
 inline void MemoryBarrier() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 // ---- modules ----

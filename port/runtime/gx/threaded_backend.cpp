@@ -15,6 +15,10 @@
 #include "subframe.h"
 #include "authored_pose.h"
 #include "window.h"
+#ifdef __APPLE__
+#include "main_thread.h"
+#include "yougame_link.h"
+#endif
 #include "gx_core.h"
 #include "vrr_detect.h"
 #include "replay_control.h"
@@ -39,7 +43,11 @@ constexpr double SIM_PERIOD = 1.0 / 60.0;
 
 class ThreadedBackend final : public Backend {
   FrameQueue queue;
+#ifdef __APPLE__
+  mac_host::MainThreadTask worker;   // the render loop runs on the main thread there (port/mac/main_thread.h)
+#else
   std::thread worker;
+#endif
   RenderOptions options_;
 
   // Runs on the render thread.
@@ -726,14 +734,28 @@ class ThreadedBackend final : public Backend {
   ThreadedBackend(RenderOptions requested, bool visible) : options_(without_exclusive_under_overlay(requested)) {
     std::promise<void> initialized;
     auto ready = initialized.get_future();
+#ifdef __APPLE__
+    worker = mac_host::MainThreadTask([this, options = options_, visible, init = std::move(initialized)]() mutable {
+#else
     worker = std::thread([this, options = options_, visible, init = std::move(initialized)]() mutable {
+#endif
       // Above normal so other programs cannot delay presentation; below the simulation thread
       // (main.cpp), which an unlocked renderer would otherwise starve.
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
       bool started = false;
       try {
+#ifdef __APPLE__
+        // As main.cpp's single-thread path on a Mac: a full screen start shows the window with its
+        // first frame; an old YouGame app's player box without a parent window starts full screen.
+        const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
+        const bool defer_fullscreen = (options.fullscreen || box_without_parent) && visible;
+        if (defer_fullscreen) host::window_prefer_simple_fullscreen();
+        void* window = host::window_create(options.window_w, options.window_h, host::window_title_base().c_str(), visible && !defer_fullscreen);
+        if (defer_fullscreen) host::window_defer_fullscreen_show();
+#else
         void* window = host::window_create(options.window_w, options.window_h, host::window_title_base().c_str(), visible);
         if (options.fullscreen && !options.exclusive_fullscreen) host::window_set_fullscreen(true);
+#endif
         // The swapchain must match the window as it is now (fullscreen covers the monitor, not window_w x window_h).
         int client_w = options.window_w, client_h = options.window_h;
         host::window_client_size(&client_w, &client_h);

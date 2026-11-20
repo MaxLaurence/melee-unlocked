@@ -293,7 +293,8 @@ typedef struct MuHostApi {
     /* Nonzero when the replay has player `port` on `frame` (a teams stock steal). */
     int32_t (*replay_stock_steal)(int32_t frame, int32_t port);
     /* One Slippi event (command byte and payload) for the recording of the played-back game. */
-    void (*replay_event)(uint8_t command, const uint8_t* payload, uint32_t size);
+    /* The command byte travels as a full 32-bit word: arm64 conventions differ on who widens a byte. */
+    void (*replay_event)(uint32_t command, const uint8_t* payload, uint32_t size);
     /* The match is over: the host writes the recording and exits. */
     void (*replay_finished)(void);
 
@@ -311,7 +312,7 @@ typedef struct MuHostApi {
      * Returns 0 on success, -1 for an unknown command, -2 for invalid bounds, and -3 for a
      * command that needs a native rollback implementation. In particular, B1/B2 (console-memory
      * savestates) MUST NOT be used by the native game. `response_size` is always initialized. */
-    int32_t (*slippi_command)(uint8_t command, const uint8_t* payload, uint32_t payload_size,
+    int32_t (*slippi_command)(uint32_t command, const uint8_t* payload, uint32_t payload_size,
                               uint8_t* response, uint32_t response_capacity,
                               uint32_t* response_size);
 

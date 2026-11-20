@@ -89,8 +89,10 @@ std::string pro_dir() {
 bool cpu_has_avx() {
 #ifdef _WIN32
   return IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE) != FALSE;
-#else
+#elif defined(__x86_64__) || defined(__i386__)
   return __builtin_cpu_supports("avx");
+#else
+  return false;   // arm64: no AVX (Android)
 #endif
 }
 

@@ -836,7 +836,7 @@ void h_render_scope(const MuNativeRenderScopeEvent* event) {
 }
 int32_t h_draw_identity() { return 1; }
 #endif
-int32_t h_slippi(uint8_t, const uint8_t*, uint32_t, uint8_t*, uint32_t, uint32_t* size) {
+int32_t h_slippi(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t, uint32_t* size) {
   if (size) *size = 0;
   return -1;
 }
