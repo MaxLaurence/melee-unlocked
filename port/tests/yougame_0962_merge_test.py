@@ -68,7 +68,7 @@ class YouGame0962MergeTest(unittest.TestCase):
 
     def test_exact_looks_run_as_upstream_in_yougame(self):
         main = source("port/app/main.cpp")
-        # Luis + Hero 10-28: YouGame runs exact looks with upstream's own validators and online eligibility.
+        # 10-28, agreed with upstream: YouGame runs exact looks with upstream's own validators and online eligibility.
         self.assertNotIn("exact looks are off in YouGame", main)
         block = main.split("  // An exact look (Diet Classic, Diet 64, Crystal) serves its pack", 1)[1]
         block = block.split("if (host::gameplay::vanilla_only())", 1)[0]
@@ -107,7 +107,7 @@ class YouGame0962MergeTest(unittest.TestCase):
         loader = host.split("#ifdef __APPLE__\n  std::string mac_error;", 1)[1]
         loader = "#ifdef __APPLE__\n  std::string mac_error;" + loader.split("  if (!entry)", 1)[0]
         for defines, resolver in (({"__APPLE__"}, "g_mac_image.symbol(name)"),
-                                  ({"_WIN32"}, "sandboxed ? image_export(module, name)"),
+                                  ({"_WIN32"}, "mapped ? image_export(module, name)"),
                                   (set(), "GetProcAddress(module, name)")):
             with self.subTest(defines=defines):
                 active = conditional_source(loader, defines)

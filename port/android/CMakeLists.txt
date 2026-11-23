@@ -131,6 +131,9 @@ target_compile_features(android_runtime PUBLIC cxx_std_17)
 target_compile_definitions(android_runtime PUBLIC SDL_MAIN_HANDLED)
 # The companion on a handheld's second screen (runtime/gx/companion.h, BottomScreen.java).
 target_compile_definitions(android_runtime PUBLIC MELEE_COMPANION)
+# Squad Strike, as the Windows and Linux hosts build it (on in every release since 0.9.990).
+include("${PORT}/cmake/squad.cmake")
+mu_squad_target(android_runtime)
 target_include_directories(android_runtime PRIVATE "${PORT}/app")
 target_include_directories(android_runtime BEFORE PUBLIC "${ANDROID_DIR}/shim")
 target_compile_options(android_runtime PRIVATE ${MELEE_ANDROID_COMMON_FLAGS})

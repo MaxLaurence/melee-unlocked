@@ -200,6 +200,9 @@ std::vector<LookPackStatus> look_packs();
 // Slow (minutes): call from a worker thread. The message says what happened either way.
 bool build_look_packs(const std::string& patcher_folder, const std::string& retail_disc, const std::string& xdelta_tool,
                       std::string* message);
+// Off: the shipped xdelta3 is the only patch tool used; a missing or broken one is never fetched again.
+// The host sets it once at startup (default on).
+void set_tool_recovery(bool allowed);
 // One click (Settings > Looks > Get mod looks): 0 Diet Melee (Classic, 64 and Crystal), 1 Animelee
 // Complete Edition, 2 Animelee x DBZ (its Dragon Ball Z edition). The authors' own download, checked
 // against its published SHA-256, built from the player's clean disc with the shipped xdelta3; each
@@ -237,6 +240,11 @@ void set_session_stage_pack(const std::string& iso_path);
 // Buttons held on any controller, in the game's pad bits (L 0x40, R 0x20, Z 0x10, B 0x200, X 0x400, Y 0x800).
 using StageButtonProbe = uint32_t (*)();
 void set_stage_button_probe(StageButtonProbe probe);
+// True while this game runs in lockstep with another (a Friends console session): no stage skin is
+// served then (a saved pick, a random draw or the session disc's alternates could differ between the
+// two games), and both load the game's own stage file.
+using LockstepProbe = bool (*)();
+void set_lockstep_probe(LockstepProbe probe);
 // The pack name a scanned disc's skins are listed under, or empty when it has none.
 std::string disc_pack_name(const std::string& iso_path);
 // True for a costume skin scanned from that disc. The Source Port lets these serve a costume file
@@ -421,6 +429,10 @@ bool costume_file(const std::string& asset_id, std::vector<uint8_t>* bytes, std:
 std::string costume_thumbnail_path(const std::string& asset_id);
 // The same for one PNG (a portrait or stock icon).
 std::string choose_portrait_file();
+
+// A copy of any game file whose only changes are texture and palette bytes, in the same layout (a
+// pack's recoloured items or menu pictures): drawing only, so it is served online too.
+bool file_textures_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate, std::string* detail);
 
 namespace testing {
 struct DatInspection {

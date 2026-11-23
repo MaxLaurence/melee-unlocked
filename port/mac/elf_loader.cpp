@@ -97,7 +97,10 @@ const Import* find_import(const char* name) {
     {"memchr", reinterpret_cast<uintptr_t>(static_cast<void* (*)(void*, int, size_t)>(&::memchr))},
     IMPORT(fflush), IMPORT(fopen), IMPORT(getenv), IMPORT(fabsf), IMPORT(strcmp), IMPORT(atoi),
     {"fabs", reinterpret_cast<uintptr_t>(static_cast<double (*)(double)>(&::fabs))},
-    IMPORT(memmove), IMPORT(sqrtf), IMPORT(fwrite),
+    IMPORT(memmove), IMPORT(sqrtf), IMPORT(fwrite), IMPORT(strcat),
+    // Host memory for host-side work only (shim/mu_css_state.c builds a log line in it): above 4 GB
+    // here, so never a pointer the game keeps in a 32-bit word.
+    IMPORT(malloc), IMPORT(free),
 #if defined(__aarch64__)
     {"mu_host_fmt_int", reinterpret_cast<uintptr_t>(&fmt_int)},
     {"mu_host_fmt_double", reinterpret_cast<uintptr_t>(&fmt_double)},
@@ -216,10 +219,13 @@ bool Image::load(const std::string& path, std::string* error) {
 #endif
     const uint8_t* file = whole.data() + elf_offset;
     const size_t file_size = size_t(elf_size);
-    elf_size_ = elf_size;
     Ehdr eh; std::memcpy(&eh, file, sizeof eh);
     require(!std::memcmp(eh.ident, "\177ELF\2\1\1", 7) && eh.type == 3 && eh.machine == kMachine && eh.version == 1,
             std::string("expected a little-endian ") + kMachineName + " ET_DYN");
+    // The ELF's own length, which the build's .snapexcl names (# dll_size): the container's section is
+    // padded to 16 KB, and the linker puts the section headers last.
+    const uint64_t headers_end = eh.shoff + uint64_t(eh.shnum) * eh.shentsize;
+    elf_size_ = eh.shnum && headers_end <= elf_size ? headers_end : elf_size;
     require(eh.ehsize == sizeof(Ehdr) && eh.phentsize == sizeof(Phdr) && eh.phnum > 0 && eh.phnum < 100 &&
             eh.phoff <= file_size && uint64_t(eh.phnum) * sizeof(Phdr) <= file_size - eh.phoff, "invalid program headers");
     std::vector<Phdr> headers(eh.phnum);

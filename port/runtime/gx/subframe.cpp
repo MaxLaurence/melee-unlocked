@@ -8,7 +8,7 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
 #endif
 static inline unsigned char _BitScanForward64(unsigned long* index, unsigned long long value) {
@@ -25,6 +25,8 @@ static inline unsigned char _BitScanForward64(unsigned long* index, unsigned lon
 #include <atomic>
 #include <mutex>
 #include <functional>
+#include <unordered_map>
+#include <array>
 #include <condition_variable>
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -37,14 +39,20 @@ namespace gx {
 EndpointStats& subframe_endpoint_stats() { static EndpointStats e; return e; }
 StageSplitAudit& subframe_stage_split_audit() { static StageSplitAudit a; return a; }
 PhaseFlipStats& subframe_phase_flips() { static PhaseFlipStats p; return p; }
+PredictGlideStats& subframe_predict_glide() { static PredictGlideStats p; return p; }
+static std::atomic<bool> g_predict_owners{false};
+void set_predict_owners(bool on) { g_predict_owners.store(on, std::memory_order_relaxed); }
+bool predict_owners() { return g_predict_owners.load(std::memory_order_relaxed); }
 // Development measurement, off unless MELEE_AUDIT_STAGE_SPLIT is in the environment: reports how
 // far apart the solver's routes place pieces of the stage that are standing still in the world.
 // Development bisect, off unless MELEE_SUBFRAME_DIAG is set: bit 1 no stage object sampling,
-// 2 no vertex blending, 4 no camera carry, 8 no UV matrices, 16 no skinned sampling, 32 no stage lock.
+// 2 no vertex blending, 4 no camera carry, 8 no UV matrices, 16 no skinned sampling, 32 no stage lock,
+// 64 menu draws whose stream cannot blend hold their current frame (the behaviour before build 47).
 static uint32_t subframe_diag() {
   static const uint32_t bits = std::getenv("MELEE_SUBFRAME_DIAG") ? (uint32_t)std::strtoul(std::getenv("MELEE_SUBFRAME_DIAG"), nullptr, 0) : 0u;
   return bits;
 }
+bool subframe_menu_hold_diag_enabled() { return (subframe_diag() & 64) != 0; }
 // Development: MELEE_DUMP_SEQ=<simulation frame> writes every draw's pairing and route for that
 // frame to subframe_dump.txt in the working directory.
 static uint64_t dump_sequence() {
@@ -739,6 +747,224 @@ void run_pairing_chunks(size_t n, const std::function<void(size_t, size_t)>& fn)
 }
 }  // namespace
 
+// The position rows of draw i that the predict glide follows: paired draws seen through a world
+// camera. Not the HUD (orthographic, screen space), and not a rebuilt vertex stream, whose rows can
+// be remapped between ticks so the previous tick's rows may belong to another object.
+uint64_t SubFrameSolver::glide_rows(size_t i) const {
+  const Pair& p = pairs_[i];
+  if (p.prev_draw < 0 || p.blend_vertices || cur_->draws[i].xf_regs[0x26] != 0) return 0;
+  uint64_t rows = p.pos_slots;
+  for (uint64_t r = rows; r;) {   // a matrix that does not fit the array is left alone
+    unsigned long bit = 0; _BitScanForward64(&bit, r); r &= r - 1;
+    if (bit + 3 > 64) rows &= ~(1ull << bit);
+  }
+  return rows;
+}
+
+// Predicting presents a draw at its latest pose plus the phase's share of this tick's motion. The
+// next tick shows whether that motion went on. When it did not (Falcon turning in a dash dance,
+// Peach stopping into a float), the last presented frame put the draw beyond where the game ever
+// had it, and the first frame of the new tick puts it back: a jump of up to a whole frame of motion
+// inside one presented frame, against the eighth of a frame every other presented frame moves. At
+// 480 presented frames a second that is the character visibly snapping back on every turn, and on
+// screen it reads as the picture disagreeing with the game. Instead, the part of the jump that
+// undoes the overshoot is kept as an offset that fades to nothing over half a tick. Only that part:
+// a draw that starts moving (a hit, a dash from standing) was never shown ahead of the game, and
+// gliding it would only delay it. A large correction is a teleport, a respawn or a cut, and snaps.
+static constexpr double kGlideTicks = 0.5;
+static constexpr float kGlideMax = 12.0f;
+static constexpr float kGlideMin = 0.01f;
+// The rows of the ten position matrices (PNMTX0-9). A glide offset moves all of them, never the
+// texture matrices further up.
+static constexpr uint64_t kPnmtxRows = 0x9249249ull;   // bits 0, 3, ..., 27
+namespace {
+// One row's share of the glide: the part of the jump back that undoes what was shown ahead of the
+// game. Zero for motion that went on, for motion from rest and for rounding (under a hundredth).
+float row_glide(float shown, float game, float now) {
+  const float overshoot = shown - game, jump = shown - now;
+  if (!std::isfinite(overshoot) || !std::isfinite(jump) || overshoot * jump <= 0 || std::abs(jump) < kGlideMin) return 0;
+  return jump > 0 ? std::min(jump, overshoot) : std::max(jump, overshoot);
+}
+// The glide is one rigid offset per fighter (every draw of that player) and per draw for everything
+// else: the median of its rows' glides. Gliding each bone by its own amount stretched a skinned mesh
+// between bones that disagree (fingers drawn as a spike on a turn, a tear at the knee), and a matrix
+// slot that holds another bone this tick measures nonsense; the median ignores the few.
+struct GlideGroups {
+  std::unordered_map<uint32_t, std::array<std::vector<float>, 3>> rows;
+  static uint32_t key(const DrawCall& d, size_t i) { return d.owner_player < 6 ? d.owner_player : 0x10000u + (uint32_t)i; }
+  void add(uint32_t k, const float g[3]) {
+    for (int c = 0; c < 3; ++c) if (std::abs(g[c]) > kGlideMax) return;   // a teleport, or another bone in this slot
+    auto& r = rows[k];
+    for (int c = 0; c < 3; ++c) r[c].push_back(g[c]);
+  }
+  bool offset(uint32_t k, float o[3]) {
+    auto it = rows.find(k);
+    if (it == rows.end() || it->second[0].empty()) return false;
+    bool any = false;
+    for (int c = 0; c < 3; ++c) {
+      auto& v = it->second[c];
+      std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+      o[c] = v[v.size() / 2];
+      if (std::abs(o[c]) < kGlideMin) o[c] = 0;
+      any |= o[c] != 0;
+    }
+    return any;
+  }
+};
+// A draw's position matrices moved by its glide offset at strength w.
+void add_glide(float* pos, uint64_t rows, const float o[3], float w) {
+  for (uint64_t r = rows | kPnmtxRows; r; ) {
+    unsigned long bit = 0; _BitScanForward64(&bit, r); r &= r - 1;
+    if (bit + 3 > 64) continue;
+    for (int c = 0; c < 3; ++c) pos[(size_t)bit * 4 + (size_t)c * 4 + 3] += w * o[c];
+  }
+}
+}  // namespace
+
+void SubFrameSolver::predict_glide(double t, std::vector<DrawMatrices>& out) const {
+  const size_t n = cur_->draws.size();
+  if (glide_sequence_ != cur_->sequence) {
+    glide_sequence_ = cur_->sequence;
+    glide_t0_ = t;
+    glide_vec_.assign(n * 3, 0.0f);
+    glide_has_.assign(n, 0);
+    if (shown_sequence_ + 1 == cur_->sequence && !shown_.empty() && shown_game_.size() == shown_xyz_.size()) {
+      std::sort(shown_.begin(), shown_.end(), [](const ShownDraw& a, const ShownDraw& b) { return a.identity < b.identity; });
+      std::vector<std::pair<uint64_t, uint32_t>> ids;
+      ids.reserve(n);
+      for (size_t i = 0; i < n; ++i) if (glide_rows(i)) ids.emplace_back(cur_->draws[i].identity, (uint32_t)i);
+      std::sort(ids.begin(), ids.end());
+      GlideGroups groups;
+      std::vector<uint8_t> matched(n, 0);
+      for (size_t k = 0; k < ids.size(); ++k) {
+        // An identity drawn twice in either tick cannot be matched to one presented pose.
+        if ((k > 0 && ids[k - 1].first == ids[k].first) || (k + 1 < ids.size() && ids[k + 1].first == ids[k].first)) continue;
+        const uint64_t id = ids[k].first; const size_t i = ids[k].second;
+        auto it = std::lower_bound(shown_.begin(), shown_.end(), id, [](const ShownDraw& a, uint64_t v) { return a.identity < v; });
+        if (it == shown_.end() || it->identity != id || (it + 1 != shown_.end() && (it + 1)->identity == id)) continue;
+        const uint64_t rows = glide_rows(i);
+        if (it->rows != rows) continue;
+        matched[i] = 1;
+        const float* shown = &shown_xyz_[it->offset];
+        const float* game = &shown_game_[it->offset];
+        const uint32_t key = GlideGroups::key(cur_->draws[i], i);
+        for (uint64_t r = rows; r; ) {
+          unsigned long bit = 0; _BitScanForward64(&bit, r); r &= r - 1;
+          float g[3];
+          for (int c = 0; c < 3; ++c, ++shown, ++game) g[c] = row_glide(*shown, *game, out[i].pos[(size_t)bit * 4 + (size_t)c * 4 + 3]);
+          groups.add(key, g);
+        }
+      }
+      PredictGlideStats& g = subframe_predict_glide();
+      bool any = false;
+      for (size_t i = 0; i < n; ++i) {
+        // A fighter's draws all move with it, matched last tick or not; anything else only when matched.
+        if (!glide_rows(i) || (cur_->draws[i].owner_player >= 6 && !matched[i])) continue;
+        float o[3];
+        if (!groups.offset(GlideGroups::key(cur_->draws[i], i), o)) continue;
+        std::memcpy(&glide_vec_[i * 3], o, sizeof o);
+        glide_has_[i] = 1; any = true;
+        ++g.draws;
+        for (float v : o) g.largest = std::max(g.largest, std::abs(v));
+      }
+      if (any) ++g.ticks;
+    }
+  }
+  const float w = (float)std::clamp(1.0 - (t - glide_t0_) / kGlideTicks, 0.0, 1.0);
+  pending_shown_.clear(); pending_xyz_.clear(); pending_game_.clear();
+  for (size_t i = 0; i < n; ++i) {
+    const uint64_t rows = glide_rows(i);
+    if (!rows) continue;
+    if (w > 0 && glide_has_.size() == n && glide_has_[i]) add_glide(out[i].pos, rows, &glide_vec_[i * 3], w);
+    pending_shown_.push_back({cur_->draws[i].identity, rows, (uint32_t)pending_xyz_.size()});
+    for (uint64_t r = rows; r; ) {
+      unsigned long bit = 0; _BitScanForward64(&bit, r); r &= r - 1;
+      for (int c = 0; c < 3; ++c) {
+        const size_t idx = (size_t)bit * 4 + (size_t)c * 4 + 3;
+        pending_xyz_.push_back(out[i].pos[idx]);
+        pending_game_.push_back(cur_->draws[i].posMatrices[idx]);
+      }
+    }
+  }
+  pending_sequence_ = cur_->sequence;
+}
+
+void SubFrameSolver::present_shown() const {
+  if (!pending_sequence_) return;
+  shown_.swap(pending_shown_); shown_xyz_.swap(pending_xyz_); shown_game_.swap(pending_game_);
+  shown_sequence_ = pending_sequence_;
+  pending_shown_.clear(); pending_xyz_.clear(); pending_game_.clear(); pending_sequence_ = 0;
+}
+
+// The uncapped path presents a new game frame the moment it arrives, before pairing (pairing costs
+// most of a millisecond on its way to the screen). It would show the new pose exactly, so the
+// overshoot of the last in-between frame snapped back there. The glide needs only three numbers per
+// row: what was shown, where the game had that draw in that tick (both kept when it was shown) and
+// where the new frame has it, so it is worked out here by identity, without the pairing, and the
+// frame goes out with each draw's own matrices plus that offset. The builds of this tick fade it.
+bool SubFrameSolver::arrival_glide(const Frame& f, std::vector<DrawMatrices>& out) const {
+  pending_shown_.clear(); pending_xyz_.clear(); pending_game_.clear(); pending_sequence_ = 0;
+  if (shown_.empty() || shown_sequence_ + 1 != f.sequence || shown_game_.size() != shown_xyz_.size() || (subframe_diag() & 256)) return false;
+  const size_t n = f.draws.size();
+  std::sort(shown_.begin(), shown_.end(), [](const ShownDraw& a, const ShownDraw& b) { return a.identity < b.identity; });
+  std::vector<std::pair<uint64_t, uint32_t>> ids;
+  ids.reserve(n);
+  for (size_t i = 0; i < n; ++i) if (f.draws[i].xf_regs[0x26] == 0) ids.emplace_back(f.draws[i].identity, (uint32_t)i);
+  std::sort(ids.begin(), ids.end());
+  GlideGroups groups;
+  std::vector<uint64_t> rows_of(n, 0);   // rows matched by identity (the draw's slots last tick)
+  for (size_t k = 0; k < ids.size(); ++k) {
+    if ((k > 0 && ids[k - 1].first == ids[k].first) || (k + 1 < ids.size() && ids[k + 1].first == ids[k].first)) continue;
+    const uint64_t id = ids[k].first; const size_t i = ids[k].second;
+    auto it = std::lower_bound(shown_.begin(), shown_.end(), id, [](const ShownDraw& a, uint64_t v) { return a.identity < v; });
+    if (it == shown_.end() || it->identity != id || (it + 1 != shown_.end() && (it + 1)->identity == id)) continue;
+    const DrawCall& d = f.draws[i];
+    rows_of[i] = it->rows;
+    const float* shown = &shown_xyz_[it->offset];
+    const float* game = &shown_game_[it->offset];
+    const uint32_t key = GlideGroups::key(d, i);
+    for (uint64_t r = it->rows; r; ) {
+      unsigned long bit = 0; _BitScanForward64(&bit, r); r &= r - 1;
+      float g[3];
+      for (int c = 0; c < 3; ++c, ++shown, ++game) g[c] = row_glide(*shown, *game, d.posMatrices[(size_t)bit * 4 + (size_t)c * 4 + 3]);
+      groups.add(key, g);
+    }
+  }
+  std::vector<float> vec(n * 3, 0.0f);
+  std::vector<uint8_t> has(n, 0);
+  uint64_t glided = 0; float largest = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const DrawCall& d = f.draws[i];
+    // A fighter's draws all move with it, matched last tick or not; anything else only when matched.
+    if (d.xf_regs[0x26] != 0 || (d.owner_player >= 6 && !rows_of[i])) continue;
+    float o[3];
+    if (!groups.offset(GlideGroups::key(d, i), o)) continue;
+    std::memcpy(&vec[i * 3], o, sizeof o);
+    has[i] = 1; ++glided;
+    for (float v : o) largest = std::max(largest, std::abs(v));
+  }
+  if (!glided) return false;
+  PredictGlideStats& g = subframe_predict_glide();
+  ++g.ticks; ++g.arrival_ticks; g.draws += glided; g.largest = std::max(g.largest, largest);
+  out.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    DrawMatrices& o = out[i];
+    const DrawCall& d = f.draws[i];
+    std::memcpy(o.pos, d.posMatrices, sizeof o.pos);
+    std::memcpy(o.nrm, d.normalMatrices, sizeof o.nrm);
+    o.vertices = nullptr;
+    o.has_projection = false;
+    if (has[i]) add_glide(o.pos, rows_of[i], &vec[i * 3], 1.0f);
+  }
+  // This tick's builds continue the same glide from full strength at phase 0, where this frame is.
+  // Keyed by draw index: the pairing that follows keeps this frame's draws in this order.
+  glide_sequence_ = f.sequence;
+  glide_t0_ = 0.0;
+  glide_vec_.swap(vec);
+  glide_has_.swap(has);
+  return true;
+}
+
 bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>& out, bool authored,
                            const std::function<bool()>* cancelled) const {
   out.resize(cur_ ? cur_->draws.size() : 0);
@@ -766,6 +992,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
   SubFrameStats* stats = &stats_;
   stats->rigid = stats->blended = stats->cuts = stats->authored = stats->carried = stats->vertex_blended = 0;
   stats->posed = stats->posed_skinned = 0;
+  stats->menu_held = stats->menu_advanced = 0;
   if (authored) {
     // Sample forward from the latest state. Unsupported/discontinuous draws hold their current
     // matrices instead of inventing motion or adding a frame of delay. Chunks run in parallel.
@@ -784,6 +1011,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
     const int chunks = n >= 128 ? pool.chunks() : 1;
     std::vector<uint32_t> counts((size_t)chunks, 0), carries((size_t)chunks, 0), blends((size_t)chunks, 0), stages((size_t)chunks, 0);
     std::vector<uint32_t> poses((size_t)chunks, 0), skinned_poses((size_t)chunks, 0);
+    std::vector<uint32_t> menu_holds((size_t)chunks, 0), menu_advances((size_t)chunks, 0);
     // A presented frame at phase 1 in Interpolate is the current simulation frame itself, so every
     // draw must leave the solver holding exactly the matrices the game loaded. Whatever does not is
     // what jumps once per tick. Checked only on those frames.
@@ -837,6 +1065,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
       AuthoredCache chain_cache;   // one sampled chain per object per chunk per presented frame
       size_t begin = n * (size_t)chunk / (size_t)chunks, end = n * (size_t)(chunk + 1) / (size_t)chunks;
       uint32_t count = 0, carried = 0, blended = 0, staged = 0, posed_count = 0, posed_skinned = 0;
+      uint32_t menu_held = 0, menu_advanced = 0;
       uint32_t lagged = 0, worst_kind = 0, worst_verts = 0; float worst_err = 0;
       for (size_t i = begin; i < end; ++i) {
         if (cancelled && ((i - begin) & 31) == 31) {
@@ -953,15 +1182,36 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
             // every draw gets the same one.
             routes_[i] = 6;
             remap.moved = false;   // a rejected stream may have filled the map only part way
-            // In a match the current stream is drawn as it is while the matrices advance below with
-            // everything else. In the menus the whole draw holds its own current frame, which is
-            // what every rebuilt draw did before the stage work: menu text and panels are rebuilt
-            // rather than moved, and what matters there is that they are all treated the same way
-            // on every tick. One of them blending while the next holds is what flickers.
+            // The current stream is drawn as it is while the matrices advance below with
+            // everything else, in the menus too. The menus used to hold the whole draw at its own
+            // current frame, which matched the rest of the screen while menus predicted from the
+            // current frame. Since menus interpolate, the rest of the screen is drawn between the
+            // previous frame and this one, and a held draw sat up to a whole tick ahead of it: as
+            // the Online menu's rows slid in at 180 Hz, the pieces of a row that were rebuilt that
+            // tick drew ahead of the pieces that blended, and the row looked doubled sideways
+            // (tester report, Windows 1268). Only a draw whose vertices kept their matrix bindings
+            // advances: a binding that really changed means the previous rows belong to another
+            // object, and that draw still holds its current frame as before.
+            // MELEE_SUBFRAME_DIAG bit 64 restores the old hold for an A/B comparison.
             if (menus) {
-              std::memcpy(o.pos, d.posMatrices, sizeof o.pos);
-              std::memcpy(o.nrm, d.normalMatrices, sizeof o.nrm);
-              continue;
+              bool same_bindings = !(diag & 64);
+              const Vertex* pv = &prev_->vertices[pd->first_vertex];
+              const Vertex* cv = &cur_->vertices[d.first_vertex];
+              const uint32_t texgens = d.xf_regs[0x3F] & 15;
+              for (uint32_t v = 0; same_bindings && v < d.vertex_count; ++v) {
+                if (pv[v].posmtx != cv[v].posmtx) same_bindings = false;
+                // A used texture generator indexed per vertex is a binding too: its row is
+                // advanced below from the previous frame's row at the same slot.
+                for (uint32_t k = 0; same_bindings && k < texgens && k < 8; ++k)
+                  if ((d.components & (VB_HAS_TEXMTXIDX0 << k)) && pv[v].texmtx[k] != cv[v].texmtx[k]) same_bindings = false;
+              }
+              if (!same_bindings) {
+                ++menu_held;
+                std::memcpy(o.pos, d.posMatrices, sizeof o.pos);
+                std::memcpy(o.nrm, d.normalMatrices, sizeof o.nrm);
+                continue;
+              }
+              ++menu_advanced;
             }
           } else {
             o.vertices = &vertex_blend_[p.blend_offset];
@@ -1155,7 +1405,15 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
           // stage (route 4). Holding it at the latest pose while the camera carried everything
           // around it forward stepped it once per tick: on Fountain of Dreams those are the
           // fountain pieces, which jumped against the stage with every vertical camera move (B-314).
-          if (!interpolate && have_camera_step && p.pos_slots && !menus && !(diag & 32) && !cur_->discontinuous) {
+          // Only a draw seen through the world camera's projection can be standing in the world. The
+          // HUD has a perspective camera of its own that never moves, so its matrices repeat exactly
+          // each tick, and against a slow pan that repeat is within the translation tolerance below:
+          // the online name tags and the delay readout under the percents (game text, no authored
+          // pose) were carried by a share of the world camera's step on every presented frame and
+          // snapped back at the tick, which is the names vibrating while the camera moves.
+          const bool world_projection = scene_draw && d.xf_regs[0x26] == 0 &&
+              std::memcmp(&d.xf_regs[0x20], &scene_draw->xf_regs[0x20], 7 * sizeof(uint32_t)) == 0;
+          if (!interpolate && have_camera_step && p.pos_slots && !menus && !(diag & 32) && !cur_->discontinuous && world_projection) {
             bool static_in_world = true;
             uint64_t rows = p.pos_slots;
             while (rows && static_in_world) {
@@ -1331,6 +1589,8 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
       stages[(size_t)chunk] = staged;
       poses[(size_t)chunk] = posed_count;
       skinned_poses[(size_t)chunk] = posed_skinned;
+      menu_holds[(size_t)chunk] = menu_held;
+      menu_advances[(size_t)chunk] = menu_advanced;
     };
     if (chunks == 1) work(0); else pool.run(work);
     if (stop.load(std::memory_order_relaxed)) return false;   // dropped: no stats, routes or flip history from a present never shown
@@ -1340,6 +1600,8 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
     for (uint32_t c : stages) stats->stage_locked += c;
     for (uint32_t c : poses) stats->posed += c;
     for (uint32_t c : skinned_poses) stats->posed_skinned += c;
+    for (uint32_t c : menu_holds) stats->menu_held += c;
+    for (uint32_t c : menu_advances) stats->menu_advanced += c;
     // Two presented frames of the same simulation frame differ only in phase. A draw that takes one
     // route at one phase and another at the next is being drawn on two timelines inside a single
     // tick, which on screen is that object flashing several times per tick.
@@ -1354,6 +1616,10 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
     }
     last_posed_ = routes_;
     last_build_phase_ = t;
+    // Predict only: glide a reversed or stopped draw back from where the last presented frame put
+    // it (MELEE_SUBFRAME_DIAG bit 256 turns this off for an A/B comparison).
+    if (!interpolate && !menus && !(diag & 256)) predict_glide(t, out);
+    else { shown_.clear(); shown_xyz_.clear(); shown_game_.clear(); pending_shown_.clear(); pending_xyz_.clear(); pending_game_.clear(); shown_sequence_ = pending_sequence_ = 0; glide_sequence_ = 0; }
     if (dump_sequence() && cur_->sequence == dump_sequence() && pair_reason_.size() == n) {
       if (FILE* f = std::fopen("subframe_dump.txt", "a")) {
         std::fprintf(f, "# sequence %llu phase %.3f interpolate %d camera_holds %d stage_carry %d: i identity gen verts posmtxidx reason route dist(out,prev) dist(out,cur) dist(prev,cur) tex0\n", (unsigned long long)cur_->sequence, t, (int)interpolate, (int)camera_holds, (int)have_stage_carry);
@@ -1371,9 +1637,10 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
             const bool has_pose = d.authored_pose != nullptr;
             const bool has_view = has_pose && d.authored_pose->has_view;
             const bool same_view = has_view && camera_current_ && d.authored_pose->view == camera_current_->view;
-            std::fprintf(f, "   pose %d view %d main_camera %d ortho %d envelope %d out_y %.2f prev_y %.2f cur_y %.2f blend_vertices %d\n",
+            std::fprintf(f, "   pose %d view %d main_camera %d ortho %d envelope %d out_y %.2f prev_y %.2f cur_y %.2f blend_vertices %d owner %u glide %d rows %llx\n",
                          (int)has_pose, (int)has_view, (int)same_view, (int)(d.xf_regs[0x26] != 0), (int)(has_pose && d.authored_pose->envelope),
-                         out[i].pos[row * 4 + 7], pd ? pd->posMatrices[row * 4 + 7] : 0.0f, d.posMatrices[row * 4 + 7], (int)p.blend_vertices);
+                         out[i].pos[row * 4 + 7], pd ? pd->posMatrices[row * 4 + 7] : 0.0f, d.posMatrices[row * 4 + 7], (int)p.blend_vertices, (unsigned)d.owner_player,
+                         (int)(glide_has_.size() == out.size() && glide_has_[i]), (unsigned long long)glide_rows(i));
           }
           if (routes_[i] == 6 && pd) {
             // Why the vertex blend was rejected: selector changes and the largest position step.

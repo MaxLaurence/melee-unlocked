@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -48,6 +49,19 @@ std::filesystem::path exe_directory() {
   DWORD n = GetModuleFileNameW(nullptr, path, (DWORD)std::size(path));
   if (!n || n >= std::size(path)) return std::filesystem::current_path();
   return std::filesystem::path(path).parent_path();
+}
+
+// The folders players drop media into. Under the YouGame app the program folder is read-only (the
+// sandbox grants it read and execute only), so they live in the game's data folder (YOUGAME_DATA).
+std::filesystem::path media_root(const char* name) {
+#if defined(_WIN32)
+  const wchar_t* data = _wgetenv(L"YOUGAME_DATA");
+  if (data && *data) return std::filesystem::path(data) / name;
+#elif !defined(__APPLE__)
+  const char* data = std::getenv("YOUGAME_DATA");
+  if (data && *data) return std::filesystem::u8path(data) / name;
+#endif
+  return exe_directory() / name;
 }
 
 struct Candidate {
@@ -343,7 +357,7 @@ struct Slot {
 class Manager {
  public:
   Manager() {
-    root_ = exe_directory() / "VideoBackgrounds";
+    root_ = media_root("VideoBackgrounds");
     std::error_code ec;
     std::filesystem::create_directories(root_, ec);
     slots_[0].stem = L"css";
@@ -391,8 +405,15 @@ class Manager {
       Slot& s = slots_[i];
       // A file Windows cannot look at (a link to itself, a cloud file it cannot fetch) counts as absent:
       // the throwing form stopped a 0.8.95 game with "status: unknown error: sss.mp4".
-      std::error_code ec;
-      const bool exists = enabled_ && media_foundation_ && std::filesystem::is_regular_file(s.video_path, ec);
+      // Looked for once a second, not on every presented frame: the two file system calls took 0.2 ms
+      // of each frame, at several hundred frames a second. A video dropped in appears within a second.
+      const double now = host::now_seconds();
+      if (enabled_ && media_foundation_ && (now < file_checked_[i] || now - file_checked_[i] >= 1.0)) {
+        std::error_code ec;
+        file_exists_[i] = std::filesystem::is_regular_file(s.video_path, ec);
+        file_checked_[i] = now;
+      }
+      const bool exists = enabled_ && media_foundation_ && file_exists_[i];
       has_video_[i] = exists;
       if (exists && !started_[i]) {
         s.decoder.start(s.video_path, i == 1);
@@ -581,7 +602,12 @@ class Manager {
   }
 
   void open() {
-    std::filesystem::create_directories(root_);
+    std::error_code ec;   // never the throwing form: a folder the game can't create must not end the game
+    std::filesystem::create_directories(root_, ec);
+    if (ec) {
+      host::log("video backgrounds: can't create %s (%s)", root_.u8string().c_str(), ec.message().c_str());
+      return;
+    }
     ShellExecuteW(nullptr, L"open", root_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   }
 
@@ -690,6 +716,8 @@ class Manager {
   bool enabled_ = true;
   bool started_[2]{};
   bool has_video_[2]{};
+  bool file_exists_[2]{};
+  double file_checked_[2]{-10.0, -10.0};
   int active_slot_ = -1;
   uint16_t last_scene_ = 0xffff;
   unsigned scene_logs_ = 0;
@@ -701,12 +729,13 @@ Manager& manager() {
 }
 
 // ---- border art: a picture or looping video behind the game picture, in the bars beside it ----
-// Files come from the Borders folder next to the program: PNG, JPG and BMP through the Windows
-// imaging codecs, MP4 through the same decoder as the menu videos. Presentation only.
+// Files come from the Borders folder (the game's data folder under YouGame, else beside the program):
+// PNG, JPG and BMP through the Windows imaging codecs, MP4 through the same decoder as the menu
+// videos. Presentation only.
 class Border {
  public:
   Border() {
-    root_ = exe_directory() / "Borders";
+    root_ = media_root("Borders");
     std::error_code ec;
     std::filesystem::create_directories(root_, ec);
   }

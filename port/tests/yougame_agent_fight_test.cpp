@@ -195,13 +195,19 @@ static void parsing(const char* scratch) {
   }
   CHECK(load({{"fight", true}, {"mute", true}}).log == "agent-test.json applied default keys: fight, mute");
   CHECK(!load({{"fight", true}}, false).fight);
-  CHECK(load({{"fight", true}}, false).log.empty());
+  // PR #85: test builds always say why nothing was read, even with no YouGame bridge or launcher.
+  CHECK(load({{"fight", true}}, false).log.rfind("agent-test.json not looked for: no YouGame bridge or launcher", 0) == 0);
   CHECK(!yougame::agent_test::load(true, nullptr).fight);
   CHECK(!yougame::agent_test::load(true, "").fight);
   std::filesystem::remove_all(directory);
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  _putenv_s("YOUGAME_AGENT_COPY", "1");
+#else
+  setenv("YOUGAME_AGENT_COPY", "1", 1);
+#endif  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   policy();
   injection();

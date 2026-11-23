@@ -34,6 +34,10 @@ fi
 docker run --rm -v "$ROOT":/src -w /src $IMAGE bash -c "
   set -e
   cmake -S sourceport/game -B build-mac-game/$ARCH -G Ninja -DCMAKE_BUILD_TYPE=Release $CONFIGURE -DCMAKE_C_FLAGS='$FLAGS' -DCMAKE_CXX_FLAGS='$FLAGS' >/dev/null
-  cmake --build build-mac-game/$ARCH --target melee_game -j \$(nproc) | grep -v '^\[' || true
+  # A failed compile must stop here: an older melee_game.so would otherwise pass the check below.
+  status=0
+  cmake --build build-mac-game/$ARCH --target melee_game -j \$(nproc) > build-mac-game/$ARCH.log 2>&1 || status=\$?
+  grep -v '^\[' build-mac-game/$ARCH.log || true
+  [ \$status -eq 0 ] || { echo 'The game library did not build (see above)'; exit \$status; }
   test -f build-mac-game/$ARCH/melee_game.so"
 echo "Game library: $WORK/$ARCH/melee_game.so"

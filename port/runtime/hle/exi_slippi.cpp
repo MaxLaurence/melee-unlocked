@@ -571,6 +571,8 @@ void prepare_gct_load(const uint8_t* payload) {
   // made for the other address, so none of them may run: Slippi's code runs from the table in RAM
   // (interpreted), and the game functions it hooks follow the hooks written into RAM.
   if (host::mod_disc_active()) ppc::add_ram_code_range(g_gct_address, g_gct_address + (uint32_t)gecko::slippi_gct_size);
+  // Its caves, reached from a function that runs from RAM, are followed in that interpreter (ppc.h).
+  ppc::set_hook_code_range(g_gct_address, g_gct_address + (uint32_t)gecko::slippi_gct_size);
   if (host::mod_disc_active() && gecko::gct_base_used && gecko::gct_base_used != g_gct_address) {
     const uint32_t lo = std::min(gecko::gct_base_used, g_gct_address);
     const uint32_t hi = std::max(gecko::gct_base_used, g_gct_address) + (uint32_t)gecko::slippi_gct_size + 0x1000;
@@ -943,7 +945,7 @@ void dma_write(uint32_t addr, uint32_t size) {
 #endif
         // ReportGameQuery has no placements. Teams needs the same Game End record that
         // Source publishes; ReportGameQuery is not used for YouGame Teams.
-        if (!host::game_image && yougame::active() && online::session_mode() == 3 && !playback::enabled() && loc + payload < size)
+        if (!host::game_image && yougame::session() && online::session_mode() == 3 && !playback::enabled() && loc + payload < size)
           host::publish_lobby_result(-1, payload ? mem[loc + 1] : 0,
               payload >= 2 ? (int)(int8_t)mem[loc + 2] : -1, payload >= 6 ? &mem[loc + 3] : nullptr);
         write_to_file(&mem[loc], payload + 1, "close"); spectate::end_game(); break;

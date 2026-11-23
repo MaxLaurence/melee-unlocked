@@ -14,6 +14,9 @@ struct Release { std::string version, published, notes; bool legacy = false; boo
 enum class RollbackState { Idle, Downloading, Ready, Failed };
 void check(const std::string& current_version, bool install_experimental = false); // true also offers the current version's complete experimental zip
 State state();
+// state() is Failed because the release check could not reach GitHub or read its answer (not a download, which
+// keeps its own failure): the launcher shows that in plain words, not as an error. Asked again quietly first.
+bool check_failed();
 std::string latest_version();                     // tag of the newest release when known (without the leading v)
 std::string message();                            // short status text for the settings panel
 std::vector<Release> releases();                  // published releases with downloadable Windows builds
@@ -120,4 +123,6 @@ void fsr_download(const std::string& game_dir_utf8);
 ModelState fsr_state(const std::string& game_dir_utf8);
 std::string fsr_message();
 constexpr const char* kFsrSize = "about 160 MB";
+// The releases feed turned into the API's list (the fallback when the API refuses), for the updater test.
+std::string releases_from_feed_for_test(const std::string& feed);
 }  // namespace host::updater

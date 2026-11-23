@@ -1374,7 +1374,9 @@ class Renderer final : public gx::Backend {
 
 }  // namespace
 
-std::unique_ptr<gx::Backend> create(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync) {
+// renderer_gl.h's factory. A prewarm-only run (main.cpp run_prewarm_only, the launcher's shader pass on
+// Windows and Linux) is not one the Mac app starts: the Metal renderer prewarms at its own start.
+std::unique_ptr<gx::Backend> create(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync, bool /*prewarm_only*/) {
   return std::make_unique<Renderer>(window, cache, scale, vsync);
 }
 void capture_efb(gx::Backend& backend, const std::filesystem::path& path) { dynamic_cast<Renderer&>(backend).capture(path); }

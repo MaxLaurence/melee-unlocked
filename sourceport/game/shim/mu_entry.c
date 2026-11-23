@@ -38,7 +38,7 @@ char* getenv(const char* name);
 /* Older hosts keep the standalone diagnostic behavior. */
 const char* mu_test_getenv(const char* name)
 {
-    return mu_host && mu_host->version >= 23 && mu_host->test_getenv
+    return mu_host && mu_host->version >= 22 && mu_host->test_getenv
         ? mu_host->test_getenv(name) : getenv(name);
 }
 
@@ -97,6 +97,17 @@ unsigned int mu_display_options(void)
 {
     return mu_host && mu_host->version >= 18 && mu_host->display_options ? mu_host->display_options() : 0;
 }
+
+/* Online port colours (Game > Online, "Port colour"): the colour each of a 1v1's two players shows on its
+ * tag and damage display, from the host's display options (MU_DISPLAY_OPTION_PORT_COLOURS: 2 bits for
+ * player 1, 2 for player 2; 0 none). Display only: gameplay and the match state keep the real ports. */
+int mu_port_colour(int slot, int pad_port)
+{
+    const unsigned int w = mu_display_options() >> 28;
+    if (w == 0 || slot < 0 || slot > 1) return pad_port;
+    return slot == 0 ? (int) (w & 3u) : (int) ((w >> 2) & 3u);
+}
+
 
 void OSReport(const char* msg, ...);
 
@@ -198,14 +209,23 @@ _Static_assert(MU_DISPLAY_NO_FIGHTER_SHADOWS == MU_DISPLAY_OPTION_NO_FIGHTER_SHA
 _Static_assert(MU_DISPLAY_CENTER_2P_HUD == MU_DISPLAY_OPTION_CENTER_2P_HUD, "display option bits");
 _Static_assert(MU_DISPLAY_BOOT_TO_CSS == MU_DISPLAY_OPTION_BOOT_TO_CSS, "display option bits");
 
-/* The Arcade look grid's colour (0 from a host before version 21: the default). */
+int mu_console_active(void);
+
+/* The camera's shake is the viewer's own. Online it may only be lowered: the camera decides which fighters count as
+ * on screen, and only those get their bones refreshed for the next frame's gameplay (ftLib_80086A8C, mu_online.c
+ * camera_tasks), so a shake past the game's own could show a fighter at the edge that the other player's game does
+ * not. Lowering it is the same as "Disable screen shake" (MU_GAME_OPTION_NO_SCREEN_SHAKE) and Slippi's own code,
+ * both always allowed online. A YouGame console session keeps the game's own camera, as it keeps its options. */
 float mu_screen_shake_scale(void)
 {
-    if (!mu_host || mu_host->version < 22 || !mu_host->screen_shake_scale) return 1.0f;
+    if (!mu_host || mu_host->version < 27 || !mu_host->screen_shake_scale) return 1.0f;
+    if (mu_console_active()) return 1.0f;
     const float scale = mu_host->screen_shake_scale();
-    return scale >= 0.0f && scale <= 4.0f ? scale : 1.0f;
+    if (!(scale >= 0.0f && scale <= 4.0f)) return 1.0f;
+    return scale > 1.0f && (mu_online_active() || mu_online_pending()) ? 1.0f : scale;
 }
 
+/* The Arcade look grid's colour (0 from a host before version 21: the default). */
 unsigned int mu_grid_color(void)
 {
     return mu_host && mu_host->version >= 21 && mu_host->grid_color ? mu_host->grid_color() : 0x3A4458u;
@@ -251,7 +271,7 @@ int mu_native_owner_tracking(void)
  * hooks in tobj.c, dobj.c, lobj.c, cobj.c and eflib.c write them only while this is nonzero. */
 int mu_native_rtx_semantics(void)
 {
-    return mu_host && mu_host->version >= 25 && mu_host->native_rtx_semantics
+    return mu_host && mu_host->version >= 32 && mu_host->native_rtx_semantics
                ? mu_host->native_rtx_semantics() != 0
                : 0;
 }
@@ -289,7 +309,8 @@ uint32_t mu_snapshot_ranges(MuStateRegion* out, uint32_t capacity);
 int mu_practice_bridge(int op, int* args, int count);
 _Static_assert(MU_PRACTICE_DIRECT_FIRST_MATCH == 9 && MU_PRACTICE_REQUEST_MAJOR == 6 && MU_PRACTICE_FRAME_PAUSE == 10 &&
                MU_PRACTICE_CPU_MOVE == 11 && MU_PRACTICE_TRAINING_PICK == 12 &&
-               MU_PRACTICE_TRAINING_STAGE == 13 && MU_PRACTICE_UNLOCKED == 14 && MU_PRACTICE_PAGE_PAUSE == 15,
+               MU_PRACTICE_TRAINING_STAGE == 13 && MU_PRACTICE_UNLOCKED == 14 && MU_PRACTICE_PAGE_PAUSE == 15 &&
+               MU_PRACTICE_BOOT_MATCH == 35,
                "practice op numbering (mu_practice.c)");
 
 /* Native game-side Slippi hooks use this instead of the console's EXI memory-mapped device. */
@@ -304,7 +325,7 @@ int32_t mu_slippi_command(uint8_t command, const uint8_t* payload, uint32_t payl
 
 static void mu_state_snapshot(MuStatePod* out)
 {
-    _Static_assert(sizeof(MuStatePod) == 76 * sizeof(uint32_t), "state POD layout");
+    _Static_assert(sizeof(MuStatePod) == 103 * sizeof(uint32_t), "state POD layout");
     mu_state_snapshot_words((uint32_t*) out);
 }
 
@@ -332,6 +353,8 @@ MU_EXPORT int32_t mu_game_entry(const MuHostApi* host, MuGameApi* game)
     game->state_regions = mu_state_regions;
     game->state_exclusions = mu_snapshot_exclusions;
     game->snapshot_ranges = mu_snapshot_ranges;
+    extern int mu_css_transfer(int, void*, unsigned);
+    game->css_state = mu_css_transfer;
     game->practice = (int32_t (*)(int32_t, int32_t*, int32_t)) mu_practice_bridge;
     return 0;
 }
@@ -364,6 +387,9 @@ static void mu_dump_stock_icon_map(void)
 
 static int32_t mu_run(void)
 {
+    uint32_t seed;
+    void mu_apply_seed(uint32_t seed);
+    if (mu_host->console_seed && mu_host->console_seed(&seed)) mu_apply_seed(seed);
     mu_fill_from_dol();   /* the font atlases the sources take from the retail binary */
     mu_dump_stock_icon_map();
     mu_general_codes_boot();   /* before main: Legacy applies its code set ahead of the game */
@@ -386,6 +412,9 @@ static void mu_early_rng_seed(void)
     static int parsed, enabled;
     static uint32_t seed;
     static unsigned at;
+    /* Frame zero is seeded before main; console sessions never accept test reseeding. */
+    uint32_t console_seed;
+    if (mu_host->console_seed && mu_host->console_seed(&console_seed)) return;
     if (!parsed) {
         const char* text = mu_test_getenv("MELEE_TEST_EARLY_RNG_SEED");
         char* end = 0;

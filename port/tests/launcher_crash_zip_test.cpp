@@ -172,7 +172,8 @@ int main() {
   const char* check_string = "123456789";
   CHECK(launcher::crash::crc32((const uint8_t*)check_string, 9) == 0xCBF43926u);
   CHECK(reference_crc32((const uint8_t*)check_string, 9) == 0xCBF43926u);
-  CHECK(std::size(launcher::crash::kParts) == 5);   // crash text, the last session, the one before it, Linux error output, the lobby
+  CHECK(std::size(launcher::crash::kParts) == 8);   // crash text, the last session, the one before it, Linux error output, the lobby,
+                                                  // the launcher's log and its YouGame log
   CHECK(launcher::crash::kMaxZipBytes == 8 * MB);
 
   const fs::path root = fs::temp_directory_path() /
@@ -199,24 +200,48 @@ int main() {
   put(game + "\\melee_port_crash.dmp", text("PrivateTesterAlpha PRIVATE_BINARY C:/Users/PrivateTesterBeta/secret"));
   put(launcher_dir + "\\lobby.log", text("profile PrivateTesterAlpha id PRIVATE_ID connected 192.168.1.44\n"));
   put(game + "\\settings.ini", text("PRIVATE_SETTINGS"));
+  // The launcher's logs (a Play that started no game, YouGame's connection and why it failed): its paths are
+  // the player's own folders.
+  put(launcher_dir + "\\launcher.log", text("2026-11-20 16:40:01 Launch failed: Windows error 5; executable=C:\\Users\\PrivateTesterDelta\\HiddenBuild\\game.exe; directory=C:\\Users\\PrivateTesterDelta\\HiddenBuild\\MeleeUnlocked\n"));
+  put(launcher_dir + "\\launcher-yougame.log", text("2026-11-20 16:40:00 yougame: at start: not connected: YouGame answered 401: the saved sign-in has ended (Connect signs in again) (1 s)\n"));
   auto files = launcher::crash::collect(game, launcher_dir);
-  const std::vector<std::string> expected = {"melee_port_crash.txt", "melee_port.log", "lobby.log"};
+  const std::vector<std::string> expected = {"melee_port_crash.txt", "melee_port.log", "lobby.log", "launcher.log", "launcher-yougame.log"};
   CHECK(names(files) == expected);
   {
     // The session before the last one travels too, when the game kept it: scrubbed like the last one,
     // and it survives the outgoing ZIP's file list.
     put(game + "/melee_port.prev.log", text("scene: major 02 minor 02 (frame 94)" + std::string(1, (char)10) + "slippi: logged in as PrivateTesterAlpha (PTA#123)" + std::string(1, (char)10)));
     auto both = launcher::crash::collect(game, launcher_dir);
-    CHECK(names(both) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log"}));
+    CHECK(names(both) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log", "launcher.log", "launcher-yougame.log"}));
     const auto packed = launcher::crash::capped_zip(both);
     std::vector<Entry> got;
-    CHECK(read_zip(packed, got) && names(got) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log"}));
+    CHECK(read_zip(packed, got) && names(got) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log", "launcher.log", "launcher-yougame.log"}));
     for (const auto& entry : got)
       if (entry.name == "melee_port.prev.log") {
         const std::string body(entry.data.begin(), entry.data.end());
         CHECK(body.find("PrivateTesterAlpha") == std::string::npos && body.find("scene: major 02") != std::string::npos);
       }
     std::remove((game + "/melee_port.prev.log").c_str());
+  }
+  {
+    // Send logs: when neither of the two newest sessions played online, the newest older one that did
+    // travels too (a ranked report sent after two Training sessions, 11-22); an offline one never does.
+    put(game + "/melee_port.prev.log", text("scene: major 1C minor 02 (frame 94)\n"));
+    put(game + "/melee_port.prev.2.log", text("scene: major 02 minor 02 (frame 94)\n"));
+    put(game + "/melee_port.prev.3.log", text("slippi: online frame 270 wall 1.0 s retrace 2 rollbacks 0\nyougame: ranked set unrated by the room, reason x\n"));
+    put(game + "/melee_port.prev.4.log", text("slippi: online frame 30 wall 1.0 s retrace 2 rollbacks 0\n"));
+    auto sent = launcher::crash::collect_logs(game, launcher_dir, {}, false);
+    std::vector<std::string> sent_names = names(sent);
+    CHECK(std::count(sent_names.begin(), sent_names.end(), std::string("melee_port.prev.3.log")) == 1);
+    CHECK(std::count(sent_names.begin(), sent_names.end(), std::string("melee_port.prev.2.log")) == 0);
+    CHECK(std::count(sent_names.begin(), sent_names.end(), std::string("melee_port.prev.4.log")) == 0);
+    // The newest log played online itself: nothing older is added.
+    put(game + "/melee_port.prev.log", text("slippi: online frame 60 wall 1.0 s retrace 2 rollbacks 0\n"));
+    sent = launcher::crash::collect_logs(game, launcher_dir, {}, false);
+    sent_names = names(sent);
+    CHECK(std::count(sent_names.begin(), sent_names.end(), std::string("melee_port.prev.3.log")) == 0);
+    for (const char* f : {"/melee_port.prev.log", "/melee_port.prev.2.log", "/melee_port.prev.3.log", "/melee_port.prev.4.log"})
+      std::remove((game + f).c_str());
   }
   auto zip = launcher::crash::capped_zip(files);
   std::vector<Entry> entries;
@@ -225,7 +250,12 @@ int main() {
   CHECK(zip.size() == exact_size(files) && zip.size() <= launcher::crash::kMaxZipBytes);
   const std::string zipped(zip.begin(), zip.end());
   const std::string report = launcher::crash::make_markdown(files, "0.8.62", "Source Port");
-  for (const char* secret : {"PrivateTesterAlpha", "PrivateTesterBeta", "PrivateTesterGamma", "C:/Users/", "/home/",
+  {
+    // The launcher's YouGame reason survives the scrub; the launcher's folders do not.
+    const std::string yg(files.back().second.begin(), files.back().second.end());
+    CHECK(files.back().first == "launcher-yougame.log" && yg.find("YouGame answered 401") != std::string::npos);
+  }
+  for (const char* secret : {"PrivateTesterAlpha", "PrivateTesterBeta", "PrivateTesterGamma", "PrivateTesterDelta", "C:/Users/", "C:\\Users\\", "/home/",
                             "HiddenBuild", "PRIVATE#123", "WXYZ#987", "192.168.1.44", "PRIVATE_BINARY", "PRIVATE_AUTH", "PRIVATE_ID", "PRIVATE_SETTINGS"}) {
     CHECK(zipped.find(secret) == std::string::npos);
     CHECK(report.find(secret) == std::string::npos);

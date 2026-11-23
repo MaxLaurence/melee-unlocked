@@ -208,6 +208,8 @@ static u32 lab_pressed(void)
     return pressed;
 }
 
+static int lab_bubbles_shown;   /* the lab last set a bubble display (not the model only) */
+
 static void lab_bubbles(void)
 {
     const unsigned int options = mu_game_options();
@@ -215,6 +217,7 @@ static void lab_bubbles(void)
                      : (options & MU_OPTION_LAB_BUBBLES_ONLY) ? 2  /* bubbles only */
                                                               : 3; /* bubbles over the model */
     HSD_GObj* gobj;
+    lab_bubbles_shown = value != 1;
     for (gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER]; gobj != NULL; gobj = gobj->next) {
         Fighter* fp = GET_FIGHTER(gobj);
         if (fp != NULL) {
@@ -223,13 +226,37 @@ static void lab_bubbles(void)
     }
 }
 
+/* The lab's hitboxes switched off: with no other lab tool on, the lab itself turns off and its frame
+ * code stops, so the fighters kept showing hitboxes until Training was left (player report, 0.9.991).
+ * The model comes back once; 20XX TE's own "Collision bubbles" keeps them when it is on. */
+static void lab_bubbles_release(void)
+{
+    HSD_GObj* gobj;
+    if (!lab_bubbles_shown) {
+        return;
+    }
+    lab_bubbles_shown = 0;
+    if (mu_te2(MU_TE2_BUBBLES)) {
+        return;
+    }
+    for (gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER]; gobj != NULL; gobj = gobj->next) {
+        Fighter* fp = GET_FIGHTER(gobj);
+        if (fp != NULL) {
+            fp->x21FC_flag.byte = 1;
+        }
+    }
+}
+
 /* 20XX TE "Collision bubbles": hitboxes and hurt capsules over the model in any offline match
  * (the lab's own setting wins in Training while the lab is on). Switching it off puts the model back. */
 void mu_te_frame_begin(void)
 {
+    int mu_console_frame_begin(void);
     static int shown;
-    const int want = mu_te2(MU_TE2_BUBBLES) && !lab_owns_bubbles();
+    int want;
     HSD_GObj* gobj;
+    mu_console_frame_begin();
+    want = mu_te2(MU_TE2_BUBBLES) && !lab_owns_bubbles();
     if (mu_te2(MU_TE2_COLOR_OVERLAYS)) {
         /* 20XX TE "Color overlays": green on every frame a fighter can act, so gaps between
          * actions (frame holes) show. The tint lasts two frames and is renewed while it applies;
@@ -317,6 +344,7 @@ void mu_lab_frame_begin(void)
 {
     u32 pressed;
     if (!lab_on()) {
+        lab_bubbles_release();
         return;
     }
     if (lab_session != (unsigned int) gm_GetCurrentSceneIndex() + 1u) {
@@ -371,6 +399,8 @@ void mu_lab_frame_begin(void)
     }
     if (mu_game_options() & MU_OPTION_LAB) {
         lab_bubbles();
+    } else {
+        lab_bubbles_release();
     }
 }
 
@@ -608,7 +638,7 @@ int mu_lab_input(void* fighter, MuLabInput* out)
          * a second in any offline match, so CPU smart DI can be checked without a controller. */
         static int te_fake = -1;
         if (te_fake < 0) {
-            te_fake = getenv("MELEE_TE_FAKE_ATTACK") != NULL;
+            te_fake = mu_test_getenv("MELEE_TE_FAKE_ATTACK") != NULL;
         }
         if (te_fake && fp->player_idx == 0 && !fp->is_sub_fighter && !mu_online_active()) {
             HSD_GObj* d = Player_GetEntity(1);

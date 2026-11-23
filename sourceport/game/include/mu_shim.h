@@ -23,6 +23,12 @@ void mu_post(MuEventFn fn, void* a, intptr_t b);
 /* One trip to the host, then whatever it delivered. Every wait in the shim goes through this. */
 void mu_poll(void);
 
+/* MU_WINDOW is mu_disc.h's (through mu_native.h, in every game build); a host-side test that builds a
+ * shim file without it has the console's addresses as they are, below 4 GB. */
+#ifndef MU_WINDOW
+#define MU_WINDOW(addr) ((void*) (uintptr_t) (unsigned int) (addr))
+#endif
+
 /* The console's physical addresses: the game hands some hardware a pointer with the cached-segment
  * bit taken off (OSCachedToPhysical). Everything the game owns sits below 4 GB, so adding the bit
  * back in 32-bit arithmetic recovers the pointer exactly, wherever it lives. */

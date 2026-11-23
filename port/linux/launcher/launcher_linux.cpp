@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -208,7 +209,23 @@ bool g_replay_active = false;
 
 bool playing() { return g_game_pid.load() != 0; }
 
+// The game executable needs its exec bit: an unzip tool that drops file modes leaves melee_source
+// without it, and the start then failed with "Permission denied" before the game could fix its own
+// helpers. Give it back for this user (logged on stderr), or return what to do. "" when it can run.
+std::string game_runnable(const std::string& exe) {
+  const std::string shown = exe.rfind(g_dir + "/", 0) == 0 ? exe.substr(g_dir.size() + 1) : exe;
+  if (access(exe.c_str(), X_OK) == 0) return {};
+  std::error_code ec;
+  std::filesystem::permissions(exe, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add, ec);
+  if (!ec && access(exe.c_str(), X_OK) == 0) {
+    std::fprintf(stderr, "%s had no exec permission (unzipped without file modes); made it executable\n", shown.c_str());
+    return {};
+  }
+  return shown + " is not executable: unzip Melee Unlocked again with a tool that keeps file permissions, "
+                 "or run chmod +x " + shown;
+}
 bool start_process(const std::vector<std::string>& argv) {
+  if (const std::string why = game_runnable(argv[0]); !why.empty()) { status(why); return false; }
   std::vector<char*> args;
   for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
   args.push_back(nullptr);
@@ -224,7 +241,19 @@ bool start_process(const std::vector<std::string>& argv) {
   std::vector<std::string> env_store;
   for (char** e = environ; *e; ++e)
     if (std::strncmp(*e, "YOUGAME_", 8) != 0 && std::strncmp(*e, "MELEE_YOUGAME_", 14) != 0) env_store.push_back(*e);
-  if (const std::string bridge = launcher::yougame::bridge_url(); !bridge.empty()) {
+  // This launcher signs in through the YouGame app (Connect, sign_in_app): it holds no YouGame sign-in of
+  // its own, so its bridge answers every game request "Connect YouGame in the launcher" (the launcher said
+  // Connected and the game said not signed in, with no window to sign in at: Linux report 11-22). The game
+  // goes to the app's own channel instead, as it does with the extension on; it keeps looking for the app,
+  // so Connect pressed after the game started is found too. The bridge serves only a sign-in of this
+  // launcher's own, when there is one.
+  const launcher::yougame::Account yg_account = launcher::yougame::account();
+  const bool own_sign_in = yg_account.signed_in && !yg_account.app;
+  if (!own_sign_in) {
+    env_store.push_back("MELEE_YOUGAME_EXTENSION=1");
+    std::fprintf(stderr, "yougame: the game uses the YouGame app's channel (%s)\n",
+                 yg_account.app ? "connected through the app" : "not connected yet");
+  } else if (const std::string bridge = launcher::yougame::bridge_url(); !bridge.empty()) {
     const std::string game_dir = argv[0].substr(0, argv[0].find_last_of('/'));
     launcher::yougame::set_build(g_yg_start_version.empty() ? std::string(MELEE_PORT_VERSION) : g_yg_start_version,
                                  std::wstring(argv[0].begin(), argv[0].end()),
@@ -496,10 +525,37 @@ bool crash_newer_than_launch() {
   const auto sys = std::chrono::time_point_cast<std::chrono::system_clock::duration>(t - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
   return sys > g_launch_time;
 }
+// What the Windows launcher tells the relay in headers (launcher_crash.inl post): without them every Linux
+// report read "Engine: unknown" and carried no crash line or note (1.0.2 reports).
+std::string header_safe(const std::string& text, size_t max) {
+  std::string out;
+  for (unsigned char c : text.substr(0, max)) out += (c >= 0x20 && c < 0x7F) ? (char)c : ' ';
+  return out;
+}
+std::string url_encoded(const std::string& text) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : text) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+  }
+  return out;
+}
 void send_report(const std::string& note) {
   if (g_sending.exchange(true)) return;
   std::thread([note] {
     auto files = launcher::crash::collect(g_dir, g_dir);
+    // A crash file from another version is an old crash, not this one: it went out with every later report
+    // (a 0.9.12 crash sent as 1.0.2's). Its first line names the version it came from.
+    std::string where;
+    for (auto it = files.begin(); it != files.end(); ++it) {
+      if (it->first != "melee_port_crash.txt") continue;
+      const std::string text(it->second.begin(), it->second.end());
+      const std::string first = text.substr(0, text.find('\n'));
+      if (first.find(std::string("version ") + MELEE_PORT_VERSION) == std::string::npos) { files.erase(it); break; }
+      where = first;
+      break;
+    }
     if (!note.empty()) files.emplace_back("note.txt", std::vector<uint8_t>(note.begin(), note.end()));
     const auto zip = launcher::crash::capped_zip(files);
     std::string body;
@@ -508,6 +564,8 @@ void send_report(const std::string& note) {
     launcher::crash::save_report(tmp, (const char*)zip.data(), zip.size());
     const std::string answer = run_capture({"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
         "-H", "Content-Type: application/zip", "-H", std::string("X-MU-Version: ") + MELEE_PORT_VERSION, "-H", "X-MU-Platform: linux",
+        "-H", "X-MU-Engine: Source Port (Linux)", "-H", std::string("X-MU-Kind: ") + (where.empty() ? "logs" : "crash"),
+        "-H", "X-MU-Crash: " + header_safe(where, 300), "-H", "X-MU-Note: " + url_encoded(note.substr(0, 2000)),
         "--data-binary", "@" + tmp, kCrashRelayUrl});
     if (answer == "200") status("Report sent. Thank you.");
     else if (answer == "429") status("A report was sent from this PC a moment ago; try again in two minutes.");
@@ -606,38 +664,31 @@ void yougame_line() {
   ImGui::SameLine();
   if (a.signed_in) {
     if (ImGui::SmallButton("Disconnect##yg")) launcher::yougame::sign_out();
-  } else if (ImGui::SmallButton("Connect##yg")) {
-    ImGui::OpenPopup("Connect YouGame");
+  } else if (ImGui::SmallButton("Connect##yg") && !g_yg_busy.exchange(true)) {
+    // Linux signs in through the YouGame app (its channel in the session's runtime folder): the launcher
+    // takes the account the app is signed in with, starting the app in its tray when it is installed.
+    // Seimy's report 11-22: Connect did nothing on Linux.
+    { std::lock_guard<std::mutex> lock(g_yg_mutex); g_yg_status = "Asking the YouGame app..."; }
+    std::thread([] {
+      std::string detail;
+      const auto result = launcher::yougame::sign_in_app(true, MELEE_PORT_VERSION, &detail);
+      std::string text;
+      switch (result) {
+        case launcher::yougame::AppSignIn::kSignedIn: text = "Connected through the YouGame app."; break;
+        case launcher::yougame::AppSignIn::kSignedOut: text = "The YouGame app is open but not signed in: sign in there, then press Connect again."; break;
+        case launcher::yougame::AppSignIn::kNoApp: text = "Install the YouGame app for Linux and sign in there, then press Connect again (Open YouGame has the download)."; break;
+        default: text = "The YouGame app did not answer (" + detail + "). Start it, sign in, then press Connect again."; break;
+      }
+      std::fprintf(stderr, "yougame: Connect through the app: %s\n", detail.c_str());
+      { std::lock_guard<std::mutex> lock(g_yg_mutex); g_yg_status = text; }
+      g_yg_busy.store(false);
+    }).detach();
   }
   ImGui::SameLine();
   if (ImGui::SmallButton("Open YouGame")) open_path(launcher::yougame::game_page());
-  if (ImGui::BeginPopupModal("Connect YouGame", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    static char email[256], pass[256];
-    ImGui::TextUnformatted("Sign in with your YouGame account. Your password goes only to YouGame.");
-    ImGui::InputText("Email", email, sizeof email);
-    ImGui::InputText("Password", pass, sizeof pass, ImGuiInputTextFlags_Password);
-    { std::lock_guard<std::mutex> lock(g_yg_mutex); if (!g_yg_status.empty()) ImGui::TextWrapped("%s", g_yg_status.c_str()); }
-    ImGui::BeginDisabled(g_yg_busy.load());
-    if (ImGui::Button("Sign in") && email[0] && pass[0]) {
-      g_yg_busy = true;
-      { std::lock_guard<std::mutex> lock(g_yg_mutex); g_yg_status = "Signing in..."; }
-      std::thread([e = std::string(email), p = std::string(pass)] {
-        std::string why;
-        const bool ok = launcher::yougame::sign_in(e, p, &why);
-        std::lock_guard<std::mutex> lock(g_yg_mutex);
-        g_yg_status = ok ? "" : why;
-        g_yg_busy = false;
-      }).detach();
-      std::memset(pass, 0, sizeof pass);
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button("Close") || launcher::yougame::account().signed_in) { std::memset(pass, 0, sizeof pass); ImGui::CloseCurrentPopup(); }
-    // yougame.co in the browser, never the app
-    if (ImGui::SmallButton("Create an account")) open_path(launcher::yougame::signup_page());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Forgot password")) open_path(launcher::yougame::reset_page());
-    ImGui::EndPopup();
+  {
+    std::lock_guard<std::mutex> lock(g_yg_mutex);
+    if (!g_yg_status.empty() && !a.signed_in) ImGui::TextWrapped("%s", g_yg_status.c_str());
   }
   if (g_yg_save.exchange(false)) save_ini();
 }
@@ -930,6 +981,7 @@ int main(int argc, char** argv) {
     for (auto& arg : args) command.push_back(arg.data());
     command.push_back(nullptr);
     if (chdir(g_dir.c_str()) != 0) { std::perror("game folder"); return 1; }
+    if (const std::string why = game_runnable(args[0]); !why.empty()) { std::fprintf(stderr, "%s\n", why.c_str()); return 1; }
     // Replacing this process lets Steam track the game and receive its real exit status.
     execv(command[0], command.data());
     std::perror("Melee Unlocked could not start");

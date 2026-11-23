@@ -28,8 +28,10 @@ mkdir -p "$GEN"
 echo "[5/6] libmain.so"
 cmake -S . -B build-android -G Ninja -DMELEE_BUILD_ANDROID=ON -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 \
-  -DANDROID_STL=c++_static -DMELEE_PORT_GEN="$GEN/port-generated" -DMELEE_ANDROID_DEPS="$ROOT/build-android-deps/arm64" >/dev/null
-cmake --build build-android
+  -DANDROID_STL=c++_static -DMELEE_PORT_GEN="$GEN/port-generated" -DMELEE_ANDROID_DEPS="$ROOT/build-android-deps/arm64" \
+  -DCURL_INCLUDE_DIR="$ROOT/build-android-deps/arm64/include" -DCURL_LIBRARY="$ROOT/build-android-deps/arm64/lib/libcurl.a" >/dev/null
+# libmain.so only: the root project's unit tests are built and run by the Windows and Linux checks.
+cmake --build build-android --target main
 echo "[6/6] The APK"
 python3 -B port/android/package_apk.py --main build-android/port/android/libmain.so --game build-android-game/melee_game.so \
   --deps build-android-deps/arm64 --out build-android/MeleeUnlocked.apk

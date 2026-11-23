@@ -56,9 +56,11 @@ inline std::set<uint32_t> visual_only_models(std::string stage_file) {
   // Yoshi's Story, grstory.c: 1 starts its animation and sets a drawing flag on its materials
   // (grStory_801E31C0, a null joint is skipped), and its updates are empty. 2 and 3 carry collision.
   if (stage_file == "grst.dat" || stage_file == "grst.usd") return {1};
-  // Final Destination, grlast.c: 1 and 2 are the backdrop; 4, 5, 6, 8 and 9 are made only by the
-  // stage's demo (grLast_OnDemoInit), never in a match. 7 is left out: it starts a particle generator.
-  if (stage_file == "grnla.dat" || stage_file == "grnla.usd") return {1, 2, 4, 5, 6, 8, 9};
+  // Final Destination, grlast.c: 1 and 2 are the backdrop. 4 to 9 are not: the match's map init
+  // (grLast_8021A9C4 -> grLast_8021B920) makes 4 to 8, the background transformation makes 9, plays
+  // their animations 0 to 8 and waits for each to end (animate_all) before the next step, which draws
+  // random numbers. A skin's copy with other animations crashed the swap (0.9.991 crash report).
+  if (stage_file == "grnla.dat" || stage_file == "grnla.usd") return {1, 2};
   return {};
 }
 
@@ -161,7 +163,7 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
     };
     size_t next = 0;
     const bool child_tail = tail && !a.pointers.count(ja + 12);
-    for (uint32_t x : ca) {
+    for (const uint32_t& x : ca) {   // by reference: its index is used below
       uint32_t match = 0;
       // Prefer an exact flag match. Exporters also change transform/visibility
       // flags while retaining the same local transform; grafting never copies
@@ -171,6 +173,15 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
           if (!used[k] && (pass < 2 ? same(x, cb[k], pass == 0) : near(x, cb[k]))) {
             match = cb[k]; used[k] = true; next = k + 1; break;
           }
+      // The same place in a branch of the same shape: a skin that moved a joint further than `near`
+      // allows (a custom Onett lowered two groups by 7 units, 11-23) still sits on it. The grafted file
+      // keeps the original's transform, so its mesh is drawn where the original's is, over the
+      // original's gameplay; only the sibling counts and the non-drawing flags have to agree.
+      const size_t index = size_t(&x - ca.data());
+      if (!match && ca.size() == cb.size() && index >= next && !used[index] &&
+          ((a.get(x + 4) & ~kDrawFlags) == (b.get(cb[index] + 4) & ~kDrawFlags))) {
+        match = cb[index]; used[index] = true; next = index + 1;
+      }
       walk(x, match, depth + 1, child_tail);
     }
   };

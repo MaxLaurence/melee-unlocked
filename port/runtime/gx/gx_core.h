@@ -3,6 +3,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <new>
 #include <vector>
 #include "gx_regs.h"
+#include "prewarm.h"
 #include "native_draw_audit.h"
 #include "../abi/mu_native_pose.h"
 #include "../host/tick_timing.h"
@@ -340,6 +342,10 @@ template <class Options> uint32_t arcade_settings_bits(const Options& o) {
          (o.arcade_combo_counter ? kArcadeComboCounter : 0u) | (o.arcade_backdrop == 2 ? kArcadeGrid : 0u);
 }
 void set_arcade_display(ArcadeSource source, uint32_t bits);
+// A player's hand-ported Gecko codes (user_gecko::hand_ports_of_codes), from the game thread: the online
+// ally indicators with the code's own tag, and the PAL stock row (kept by the HUD size slider).
+void set_code_ally_tag(bool on, const std::string& text, bool arrow);
+void set_code_pal_stock(bool on);
 // Without the hitboxes and the combo counter while clean_replay_active(): the look's own picture
 // (its grid, its 2D camera) stays.
 uint32_t arcade_display();
@@ -350,7 +356,7 @@ bool clean_replay_active();
 void set_native_hud_player(int slot, bool present, int damage, int stocks, float tag_x, float tag_y,
                            bool tag_visible);
 void set_native_hud_combo(int slot, int link, float percent, bool stunned);   // MuHostApi.hud_combo, simulation thread
-// Host API 24: Nana's damage and the player's team, for the community codes' overlays.
+// Since host API 31 (upstream's 24): Nana's damage and the player's team, for the community codes' overlays.
 void set_native_hud_extras(int slot, int nana_damage, int team);
 void set_native_hud_pro_tag(int slot, float dx, float width);
 // The actions in which a fighter cannot act for the combo counter: damage and tumble, down and tech,
@@ -394,6 +400,17 @@ inline bool frame_in_match(const Frame& f) {
   const bool match_mode = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
                           (major >= 0x1D && major <= 0x1F);
   return match_mode && minor >= 2;
+}
+
+// What the app hears as a match (yg {"match":1}): frame_in_match without the screens that follow a
+// VS match. The lobby chip hides during the fight and comes back on the results screen, which is
+// minor 4 and up in VS and its variants (2 the match, 3 sudden death).
+inline bool frame_in_app_match(const Frame& f) {
+  if (!frame_in_match(f)) return false;
+  const uint8_t major = f.scene_major;
+  const bool vs_family = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
+                         (major >= 0x1D && major <= 0x1F);
+  return !vs_family || f.scene_minor <= 3;
 }
 
 // Whether a frame's scene is presented wide when a widescreen mode is on. Every screen in the game
@@ -736,6 +753,11 @@ bool subframes_active();
 struct RenderOptions;
 struct Backend {
   virtual ~Backend() = default;
+  virtual PrewarmStats prewarm_stats() const { return {}; }
+  // Simulation restart, dispatched synchronously on the backend's owning thread.
+  // Unknown backends refuse BEFORE game memory is restored.
+  virtual bool supports_game_reset() const { return false; }
+  virtual void reset_game_state() {}
   virtual const RenderOptions* presentation_options() const { return nullptr; }
   virtual void resize(int, int) {}
   virtual void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const {
@@ -765,6 +787,12 @@ struct Backend {
   // display's own counts while frames come slower than the refresh: a fixed display still refreshes
   // at its full rate and repeats frames, a variable one refreshes once per frame. Render thread.
   virtual int variable_refresh() const { return -1; }
+  // Latency probe (MELEE_TRACE_LATENCY=1 with an input script): the id of the present just made,
+  // 0 when this renderer cannot tell when a present reached the screen; then, for that id, when it
+  // did on the now_seconds clock: 1 known (*seconds set), 0 not yet, -1 never. Only Vulkan with
+  // VK_GOOGLE_display_timing knows (Linux and macOS drivers); OpenGL and Direct3D say -1. Render thread.
+  virtual uint64_t probe_present_id() { return 0; }
+  virtual int probe_presented(uint64_t, double*) { return -1; }
   // NVIDIA frame generation running now with a fixed multiplier (2 to 6): the presentation loop
   // renders that many times fewer frames, and generation fills the rest up to the target rate.
   // 1 when it is off or in Dynamic mode (NVIDIA picks the multiplier itself).
@@ -772,9 +800,8 @@ struct Backend {
   // The display's counts could be read at the last look (false while Windows composes the window).
   virtual bool display_counts_readable() const { return false; }
   // From the presentation loop, every frame: the monitor's nominal refresh rate (what the verdict
-  // above is judged against), and whether to present synced even with V-Sync off. The loop asks for
-  // that on a display that follows the frames, where it costs no delay while the rate stays under
-  // the refresh, and stops every tear.
+  // above is judged against), and an explicit scanline-sync request. VRR detection changes the
+  // frame cap only; it must not silently turn V-Sync on when the player has switched it off.
   virtual void set_display_refresh(double /*hz*/, bool /*tear_free*/) {}
   // Scanline sync on a fixed-refresh display (vblank_clock.h): the first vertical blank at or after
   // `after` (now_seconds clock) and the refresh period, or false with the reason in `why`. Render thread.
@@ -791,9 +818,19 @@ struct Backend {
   virtual void submit_frame(const Frame& frame, const DrawMatrices* overrides) { (void)overrides; submit_frame(frame); }
   // Drain mode: execute the frame's commands (copies, clears, uploads) but do not blit or present it.
   virtual void set_skip_present(bool) {}
+  // A submit that may be cut short: while `cancel` is set, the renderer polls it between draws and,
+  // once it answers true, records no more of the frame and does not present it (the frame's clears
+  // still run, so the next frame starts from an empty EFB). Only for a repeated present of a frame
+  // already shown once: its texture copies exist from that first present. submit_cancelled() says
+  // whether the last submit ended that way. Renderers that cannot do it never cancel.
+  virtual void set_submit_cancel(const std::function<bool()>*) {}
+  virtual bool submit_cancelled() const { return false; }
+  virtual double submit_cancel_time() const { return 0.0; }   // latency trace: when the last cancel was noticed (now_seconds)
 };
 
 void init(Backend* backend);
+bool supports_game_reset();
+std::function<void()> capture_boot_state();
 void write_fifo(uint32_t value, int bytes);   // write-gather pipe byte stream
 void write_fifo_bytes(const uint8_t* data, size_t bytes);   // the same stream in bulk, big-endian as the pipe carries it
 void stats(uint64_t* commands, uint64_t* draws, uint64_t* vertices, uint32_t* efb_copies);
@@ -817,6 +854,10 @@ bool active_native_scope_is_skinned();
 // The native game reports draw owners in the command stream (token 0xF1) instead of through the
 // render observer.
 void set_native_owner_source(bool native);
+// Predict ahead glides each fighter back as one piece, so it needs to know which draws are whose:
+// on, draw owners are tracked whatever the looks need (subframe.cpp).
+void set_predict_owners(bool on);
+bool predict_owners();
 NativePoseBridgeStats native_pose_bridge_stats();
 void finish_native_pose_scope(uint32_t scope_id);
 const uint8_t* tmem();

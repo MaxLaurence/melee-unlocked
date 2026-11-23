@@ -38,6 +38,7 @@ constexpr float kTrueAspectMax = 64.0f / 27.0f;
 constexpr float kTrueAspectMin = 4.0f / 3.0f;
 
 struct RenderOptions {
+  bool prewarm_only = false;   // device and startup caches only; never present or start the game
   // The decompiled Source Port shares the host UI and renderers with Legacy, but it does not run
   // the translated guest's Slippi/Gecko patch hooks. Keep that distinction explicit in the UI and
   // in presentation defaults without changing the user's saved Legacy settings.
@@ -115,7 +116,7 @@ struct RenderOptions {
   // hidden (H shows it). For tournament VODs and clips. The game's own HUD and the chosen look stay.
   bool clean_replays = false;
   // Lab view: draw matches as Slippi Lab draws replays (flat silhouettes on a plain stage) over
-  // the game image. Display only, so it is safe online. F3 toggles it. See lab_view.h.
+  // the game image. Display only, so it is safe online. Ctrl+F3 toggles it. See lab_view.h.
   bool lab_view = false;
   // While the Lab view covers the window, skip replaying the game's own draws: the scene would be
   // drawn only to be painted over. Saves the GPU (and draw submission) its whole frame in a match.
@@ -123,6 +124,9 @@ struct RenderOptions {
   int input_overlay_ports = 1;    // bitmask of the controller ports it shows (bit 0 = port 1)
   bool input_overlay_values = false;
   int input_overlay_stick = 5;
+  // Where each port's controller overlay was last left (x, y, width, height in window pixels); width 0: not
+  // moved yet (it starts in the bottom left corner of the picture). Saved, so it comes back where it was.
+  float input_overlay_rect[4][6] = {};   // x, y, width, height, screen width, screen height
   bool input_overlay_hide_border = false;  // draw the pads with no panel background or resize grip
   // Drop in-world translucent effects to buy frame rate on weak machines: 0 everything, 1 skips
   // effects that do not write depth (sparks, glow, smoke), 2 skips translucent world geometry too.
@@ -272,6 +276,10 @@ struct RenderOptions {
   // gecko::option_offline_results (host.cpp); Source Port: MU_GAME_OPTION3_SKIP_RESULTS.
   bool results_screen = true;
   static bool& live_results_screen() { static bool value = true; return value; }
+  // "Show Training mode's HUD" (ini key training_hud, on unless the file says 0). Off, Training's own
+  // speed, enemy and damage panels are not drawn while its menu is closed (MU_DISPLAY_HIDE_TRAINING_HUD).
+  bool training_hud = true;
+  static bool& live_training_hud() { static bool value = true; return value; }
   // Faster sound effects (Audio): each new sound starts in the sound frame mixed now, 5 ms sooner.
   // Offline only (the host gives the game 0 online and in replays).
   static bool& live_audio_early_keyon() { static bool value = false; return value; }
@@ -279,9 +287,10 @@ struct RenderOptions {
   static bool& live_mute_voices() { static bool value = false; return value; }
   bool offline_delay = false;
   int offline_delay_frames = 2;  // independent of the online delay; enabled separately for old settings
-  // Early inputs (Online, ini key early_inputs, on unless the file says 0): controller changes go
+  // Early inputs (Online, ini key early_inputs3, on unless the file says 0): controller changes go
   // to the other player the moment they happen (host/early_input.h). Applied with
-  // host::early_input::set_enabled when the file is read and when the toggle changes.
+  // host::early_input::set_enabled when the file is read and when the toggle changes. On by default
+  // (owner 11-22); 1.0.2 to 1.0.5 saved it off for everyone under early_inputs2, which is not read.
   bool early_inputs = true;
   // Slippi Dolphin's spectator server (Game tab, Online; ini keys slippi_spectator, on unless the
   // file says 0, and slippi_spectator_port, 51441): the game's recording events on a local ENet
@@ -295,8 +304,10 @@ struct RenderOptions {
   bool online_return_training = false;
   static bool& live_online_return_training() { static bool value = false; return value; }
   // After an online session: straight into a Training match, then "search again?" (native_practice.cpp).
-  bool online_back_to_training = true;
-  static bool& live_online_back_to_training() { static bool value = true; return value; }
+  // Off by default (owner 11-19: players were sent into Training after every session). Saved as
+  // online_training_after; the older key online_back_to_training (saved on by default) is not read.
+  bool online_back_to_training = false;
+  static bool& live_online_back_to_training() { static bool value = false; return value; }
   // Warm-up room (native_practice.cpp, slippi_warmup.h; Game tab, Online). warmup_button: the WARM UP
   // button on the online character select (L+R works either way). warmup_turn_instant: in an arena
   // room, the player's turn takes them back from Training at once instead of after a 3 second
@@ -308,6 +319,14 @@ struct RenderOptions {
   // dragged and sized with the mouse).
   bool warmup_button = true;
   static bool& live_warmup_button() { static bool value = true; return value; }
+  // Play while searching (native_practice.cpp, a kept search): leaving the search screen while a search
+  // runs. 0 ask on the character select (the default; nothing else changes until the player says yes),
+  // 1 keep searching without asking, 2 never (leaving stops the search, as before). Saved as keep_search.
+  int keep_search = 0;
+  static int& live_keep_search() { static int value = 0; return value; }
+  // The banner while a kept search runs: 0 a slim pill at the top (the default), 1 orange letters. Saved as search_banner.
+  int search_banner = 0;
+  static int& live_search_banner() { static int value = 0; return value; }
   // The warm-up's panel and boxes in the black bar: 0 a rounded box with space all round (the default),
   // 1 a side card: flush in the bar as the Arena corner cards (a gold wash, a gold edge on the picture's
   // side), level with the room's match window; 2 the side card at the top of the bar, the match window too.
@@ -404,13 +423,22 @@ struct RenderOptions {
   bool window_pinned = false;
   AspectMode aspect = AspectMode::Auto;   // --aspect, or "aspect" in port-settings.ini
   bool vsync = true;  // Fresh installs synchronize scanout; a saved explicit choice still wins.
+  // The player never chose V-Sync (no "vsyncchoice 1" in the file): off once the display is found to
+  // run G-Sync or FreeSync (frames are held under its refresh, so nothing tears), on otherwise.
+  bool vsync_auto = false;
+  // The last session found G-Sync or FreeSync ("vrrfound 1" in the file). With vsync_auto this launch
+  // then starts with V-Sync off instead of on: finding it again takes several seconds of every launch,
+  // and those seconds ran with V-Sync's delay. A display found to be fixed turns it back on.
+  bool vrr_found = false;
+  // The display's variable refresh as the frame pacer last detected it: 1 on, 0 off, -1 not known yet.
+  static std::atomic<int>& live_variable_refresh() { static std::atomic<int> value{-1}; return value; }
   bool widescreen = false;    // Slippi Widescreen 16:9 code on (present at 16:9 and tell the game)
   // EXPERIMENTAL: widen the frustum in the renderer rather than running the Gecko code, so the HUD
   // and the 2D layer keep their authored size and nothing is written to guest memory. Mutually
   // exclusive with `widescreen`: both together would widen twice. See gx_shader.h.
   bool true_widescreen = false;
   // The aspect True widescreen widens to: 16:9, 16:10, the player's own W:H, or the window's shape.
-  // Presentation only. "truewsaspect" and "truewscustom W H" in the ini; files without them keep 16:9.
+  // Presentation only. "truewsaspect" and custom W:H in the ini; default to the window's shape.
   TrueAspect true_aspect = TrueAspect::Wide16_9;
   int true_custom_w = 21, true_custom_h = 9;
   // Custom texture packs: replace game textures with PNGs from Load/Textures/GALE01, using
@@ -472,6 +500,8 @@ struct RenderOptions {
   uint32_t capture_burst = 0;  // if set, capture this many consecutive presented frames from capture_frame
   uint64_t capture_sim_frame = 0;  // if set, the burst starts at the first presented frame whose simulation sequence >= this
   std::string shader_cache = "shadercache";   // directory for compiled shader blobs and the D3D12 pipeline library
+  bool shader_cache_shared = false;  // --shader-cache named it: another build (YouGame's copies) may use it too, so
+                                     // the other builds' shader folders are never pruned from it
   std::string dump_path;      // write a text dump of draw state + shaders at dump_frame
   uint32_t dump_frame = 0;
 };

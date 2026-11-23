@@ -12,11 +12,12 @@
 // adapter through as a HID device, and on Windows for an adapter still on its stock HID driver.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "host.h"
-#include "phob.h"
 #include "yougame_link.h"
 #ifndef _WIN32
 #include "pad_mirror_posix.h"
 #endif
+#include "phob.h"
+#include "phob_adapter_input.h"
 #define NOMINMAX
 #include <windows.h>
 #ifdef _WIN32
@@ -111,17 +112,7 @@ GCScopeSample g_scope[4][kScopeLen];
 uint32_t g_scope_head[4] = {};
 
 phob::HardwareInput phob_input(const uint8_t* c, const Origin& o) {
-  phob::HardwareInput in;
-  uint16_t b = 0;
-  if (c[1] & 0x01) b |= PAD_A; if (c[1] & 0x02) b |= PAD_B; if (c[1] & 0x04) b |= PAD_X; if (c[1] & 0x08) b |= PAD_Y;
-  if (c[1] & 0x10) b |= PAD_LEFT; if (c[1] & 0x20) b |= PAD_RIGHT; if (c[1] & 0x40) b |= PAD_DOWN; if (c[1] & 0x80) b |= PAD_UP;
-  if (c[2] & 0x01) b |= PAD_START; if (c[2] & 0x02) b |= PAD_Z; if (c[2] & 0x04) b |= PAD_R; if (c[2] & 0x08) b |= PAD_L;
-  in.buttons = b;
-  in.ax = c[3]; in.ay = c[4]; in.cx = c[5]; in.cy = c[6];
-  in.ax0 = o.sx; in.ay0 = o.sy; in.cx0 = o.cx; in.cy0 = o.cy;
-  in.la = (uint8_t)(c[7] > o.tl ? c[7] - o.tl : 0);
-  in.ra = (uint8_t)(c[8] > o.tr ? c[8] - o.tr : 0);
-  return in;
+  return phob::adapter_input(c, o);
 }
 
 // Called with g_mutex held, for each new report.
@@ -260,7 +251,13 @@ libusb_device* find_adapter(libusb_device** list, ssize_t count, std::string* ot
   for (ssize_t i = 0; i < count; ++i) {
     libusb_device_descriptor desc{};
     if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
-    if (desc.idVendor == 0x057E && desc.idProduct == 0x0337) { adapter = list[i]; break; }
+    // Nintendo's adapter (and every clone), or the Lossless adapter in its lag-test mode: it re-enumerates as
+    // 2e8a:102b (its RP2040's own ID) while the Lossless Adapter Manager's test runs, with the same report
+    // stream (GitHub #76). Its endpoints are read from its descriptors below, as for any adapter.
+    if ((desc.idVendor == 0x057E && desc.idProduct == 0x0337) || (desc.idVendor == 0x2E8A && desc.idProduct == 0x102B)) {
+      adapter = list[i];
+      break;
+    }
     if (others && listed < 16) {
       char id[16];
       std::snprintf(id, sizeof id, "%04x:%04x", desc.idVendor, desc.idProduct);
@@ -376,6 +373,12 @@ void reader_thread() {
       if (got == 37 && buf[0] == 0x21) {
         const auto received = std::chrono::steady_clock::now();
         last_report = received;
+        if (lagtest_flash_mode() == 1) {
+          // Any socket: X white, A black (the lag test holds one, then the other).
+          uint8_t held = 0;
+          for (int port = 0; port < 4; ++port) if (buf[1 + port * 9] & 0x30) held |= buf[2 + port * 9];
+          if (held & 0x04) lagtest_flash_report(1); else if (held & 0x01) lagtest_flash_report(0);
+        }
         if (++reports_in_window == 50) {
           const double seconds = std::chrono::duration<double>(received - poll_window_start).count();
           g_poll_rate_hz.store(seconds > 0.0 ? 50.0 / seconds : 0.0, std::memory_order_relaxed);
@@ -510,7 +513,7 @@ bool open_hid() {
     std::string path = buf.detail.DevicePath;
     std::string lower = path;
     for (char& c : lower) c = (char)std::tolower((unsigned char)c);
-    if (lower.find("vid_057e&pid_0337") == std::string::npos) continue;
+    if (lower.find("vid_057e&pid_0337") == std::string::npos && lower.find("vid_2e8a&pid_102b") == std::string::npos) continue;
     seen = true;
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
@@ -790,9 +793,8 @@ std::once_flag g_scanner_started;
 void scanner_thread();
 
 void ensure_scanner_started() {
+  // The app owns the adapter in stdio-bridge mode; hidden tests also never open it.
   if (!direct_adapter_allowed()) return;
-  // (direct_adapter_allowed covers --no-gc-adapter: every hidden test run never opens the adapter,
-  // whoever asks; the Controls tab's status line used to start the scanner and take a real adapter.)
   std::call_once(g_scanner_started, [] {
     g_scanner_run.store(true);
 #ifdef GC_ADAPTER_TEST_HOOK
@@ -901,6 +903,9 @@ uint32_t gcadapter_poll(PadState out[4]) {
 #else
     if (!read_mirror(rep)) return 0;
 #endif
+    // The PhobGCC settings (calibration, trigger modes, filters) run on every report, as they do on
+    // the adapter's own reports below; without this a YouGame launch ignored the whole PhobGCC menu.
+    phob_process(rep, std::chrono::steady_clock::now());
   } else {
     ensure_scanner_started();
     auto now = std::chrono::steady_clock::now();
@@ -1092,8 +1097,13 @@ phob::Settings gcadapter_phob_get(int port) {
 }
 
 bool gcadapter_phob_raw(int port, phob::HardwareInput& in) {
-  if (port < 0 || port > 3) return false;
+  if (port < 0 || port > 3 || options.no_gc_adapter) return false;
   std::lock_guard<std::mutex> lk(g_mutex);
+  if (yougame::stdio_bridge()) {
+    attach_mirror();
+    uint8_t report[37];
+    return mirror_live(report) && phob::mirror_input(report, port, g_origin[port], in);
+  }
   if (!g_have_report || !g_origin[port].set) return false;
   const uint8_t* c = g_report + 1 + port * 9;
   if (!(c[0] & 0x30)) return false;
@@ -1103,6 +1113,13 @@ bool gcadapter_phob_raw(int port, phob::HardwareInput& in) {
 
 int gcadapter_scope(int port, GCScopeSample* out, int max) {
   if (port < 0 || port > 3 || max <= 0) return 0;
+  if (yougame::stdio_bridge()) {
+    phob::HardwareInput in;
+    if (!gcadapter_phob_raw(port, in)) return 0;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    out[0] = phob::live_sample<GCScopeSample>(in, (uint32_t)us);
+    return 1;
+  }
   std::lock_guard<std::mutex> lk(g_mutex);
   const uint32_t head = g_scope_head[port];
   const int n = (int)std::min<uint32_t>((uint32_t)std::min(max, kScopeLen), head);

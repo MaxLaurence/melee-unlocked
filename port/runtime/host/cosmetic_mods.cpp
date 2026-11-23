@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -199,6 +200,8 @@ std::string g_look_pack;
 std::string g_session_stage_pack;
 // Buttons held on any controller, asked when a match's stage is planned (set_stage_button_probe).
 uint32_t (*g_stage_buttons)() = nullptr;
+// A lockstep session is running (set_lockstep_probe).
+bool (*g_lockstep)() = nullptr;
 // Newly built packs have been hash-verified, but are scanned for assets at the next start.
 bool g_look_prepared_this_run = false;
 
@@ -1547,19 +1550,47 @@ constexpr uint32_t kVisualFlags = 0x1u | 0x2u | 0x4u | 0x8u | 0x10u | 0x20u | 0x
 // are compared as numbers with a small tolerance; a real change of a joint is far larger.
 // Returns which parts of the rest pose differ (0 when none do), so the reason can say what changed.
 constexpr uint32_t kRestRotated = 1, kRestResized = 2, kRestMoved = 4;
+// The game builds a joint's rotation from its three angles as Rz * Ry * Rx (HSD_MtxSRT). One
+// rotation has more than one set of angles: (x+pi, pi-y, z+pi) and +-pi are the same turn, and model
+// tools pick either when they export. Comparing the angles called such a skin "rotated" (a Falco
+// skin, 11-23); the rotation matrices are what the bones get, so those are compared.
+inline void rest_rotation(float x, float y, float z, double m[9]) {
+  const double cx = std::cos(x), sx = std::sin(x), cy = std::cos(y), sy = std::sin(y), cz = std::cos(z), sz = std::sin(z);
+  m[0] = cy * cz; m[1] = cz * sx * sy - cx * sz; m[2] = cx * cz * sy + sx * sz;
+  m[3] = cy * sz; m[4] = cx * cz + sx * sy * sz; m[5] = cx * sy * sz - cz * sx;
+  m[6] = -sy;     m[7] = cy * sx;                m[8] = cx * cy;
+}
 inline uint32_t rest_pose_difference(const uint8_t* p, const uint8_t* q) {
   uint32_t differs = 0;
-  for (int i = 0; i < 9; ++i) {
+  {
+    float a[3], b[3];
+    bool finite = true, same = true;
+    for (int i = 0; i < 3; ++i) {
+      uint32_t ua = be32(p + i * 4), ub = be32(q + i * 4);
+      std::memcpy(&a[i], &ua, 4); std::memcpy(&b[i], &ub, 4);
+      finite = finite && std::isfinite(a[i]) && std::isfinite(b[i]);
+      same = same && ua == ub;
+    }
+    if (!same) {
+      if (!finite) differs |= kRestRotated;
+      else {
+        double ma[9], mb[9];
+        rest_rotation(a[0], a[1], a[2], ma);
+        rest_rotation(b[0], b[1], b[2], mb);
+        // The first three values are the rest rotation, which a fighter's animations replace on every
+        // frame, so an exporter's rounding there gets more room than in scale and translation.
+        for (int i = 0; i < 9; ++i) if (std::fabs(ma[i] - mb[i]) > 1e-2) { differs |= kRestRotated; break; }
+      }
+    }
+  }
+  for (int i = 3; i < 9; ++i) {
     uint32_t ua = be32(p + i * 4), ub = be32(q + i * 4);
     float fa, fb; std::memcpy(&fa, &ua, 4); std::memcpy(&fb, &ub, 4);
     if (ua == ub) continue;
     const uint32_t part = i < 3 ? kRestRotated : i < 6 ? kRestResized : kRestMoved;
     if (!std::isfinite(fa) || !std::isfinite(fb)) { differs |= part; continue; }
     const float scale = std::max(1.0f, std::max(std::fabs(fa), std::fabs(fb)));
-    // The first three values are the rest rotation, which a fighter's animations replace on every
-    // frame, so an exporter's rounding there gets more room than in scale and translation.
-    const float tolerance = i < 3 ? 1e-2f : 1e-3f;
-    if (std::fabs(fa - fb) > tolerance * scale) differs |= part;
+    if (std::fabs(fa - fb) > 1e-3f * scale) differs |= part;
   }
   return differs;
 }
@@ -6028,6 +6059,27 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
           runtime_errors.push_back(asset->info.name + ": malformed stage tables; using the standard stage.");
           continue;
         }
+        // Fewer collision lines or groups than the original: the stage's own code finds its lines and
+        // groups by number (Pokemon Stadium's transformations, moving platforms), and one that is not
+        // there stops the game ("mplib.c: not found lineID=140", a Stadium skin with its own collision
+        // on the Melee 3D disc). Offline too, that skin gives way to the standard stage.
+        if (clean_read) {
+          stage_safety::Archive o{clean}, k{served};
+          if (o.parse() && k.parse() && o.roots.count("coll_data") && k.roots.count("coll_data")) {
+            const uint32_t co = o.roots.at("coll_data"), ck = k.roots.at("coll_data");
+            if (o.bounds(co, 0x30) && k.bounds(ck, 0x30)) {
+              const uint32_t lines_o = o.get(co + 0x0C), lines_k = k.get(ck + 0x0C);
+              const uint32_t groups_o = o.get(co + 0x28), groups_k = k.get(ck + 0x28);
+              if (lines_k < lines_o || groups_k < groups_o) {
+                host::log("cosmetics: stage %s rejected: the skin's collision has %u lines and %u groups, the stage's "
+                          "own code needs the original's %u and %u; using the standard stage",
+                          disc_file.path.c_str(), lines_k, groups_k, lines_o, groups_o);
+                runtime_errors.push_back(asset->info.name + ": its collision is missing parts the stage needs; using the standard stage.");
+                continue;
+              }
+            }
+          }
+        }
         std::string validation_error;
         // A skin that does not match the original as it is: offline it is served as it is, and
         // online (and in replays) its meshes drawn over the original stage (stage_online_form). The
@@ -6513,6 +6565,10 @@ void set_stage_button_probe(StageButtonProbe probe) {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_stage_buttons = probe;
 }
+void set_lockstep_probe(LockstepProbe probe) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_lockstep = probe;
+}
 std::string disc_pack_name(const std::string& iso_path) {
   std::error_code ec;
   const std::string key = fs::absolute(fs::u8path(iso_path), ec).u8string();
@@ -6705,6 +6761,14 @@ RepublishResult republish_stage(uint8_t* fst, uint32_t fst_size, const std::stri
   return result;
 }
 
+bool file_textures_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate, std::string* detail) {
+  std::string local;
+  if (!detail) detail = &local;
+  if (!visual_dat_only(clean, candidate, detail)) return false;
+  *detail = "textures only";
+  return true;
+}
+
 bool stage_gameplay_matches(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate,
                             std::string* detail) {
   std::string local;
@@ -6831,8 +6895,12 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
   const bool session = std::any_of(g_assets.begin(), g_assets.end(), [&](const AssetRecord& asset) {
     return session_stage_record(asset) && selection_key(asset) == target;
   });
-  const bool pick_any = g_profile.random_stage_skins || session;
-  if (!pick_any && previous == current->stage_matches.end()) return result;
+  // In a lockstep session (Friends) the two games must load the same stage file, and each game's own
+  // pick (a saved stage skin, a random draw, the disc's alternates by held button) can differ: every
+  // stage is the game's own there, published even for a first match, as a saved skin may be applied.
+  const bool lockstep = g_lockstep && g_lockstep();
+  const bool pick_any = !lockstep && (g_profile.random_stage_skins || session);
+  if (!lockstep && !pick_any && previous == current->stage_matches.end()) return result;
 
   std::vector<std::string> eligible;
   std::vector<uint32_t> eligible_buttons;
@@ -6910,6 +6978,7 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
     }
   }
   if (by_button) {
+  } else if (lockstep) {
   } else if (!pick_any) {
     const auto fixed = g_profile.selections.find(target);
     if (fixed != g_profile.selections.end() && fixed->second != kVanillaSelection) chosen = fixed->second;
@@ -7272,7 +7341,15 @@ std::string retail_disc_problem(const fs::path& path) {
   const uint64_t size = fs::file_size(path, ec);
   char head[8]{};
   std::ifstream file(path, std::ios::binary);
-  if (ec || !file || !file.read(head, sizeof head)) return "The game disc file could not be read.";
+  if (ec || !file || !file.read(head, sizeof head)) {
+    // Which file and why (a report said only "could not be read", 11-22): the path the game was given and
+    // Windows' own reason, so the next report names the cause.
+    const std::string why = ec ? ec.message() : std::generic_category().message(errno);
+    host::log("cosmetics: the game disc %s could not be read for the looks (%s)", path.u8string().c_str(), why.c_str());
+    if (path.empty()) return "The game disc file could not be read: this game was started without one.";
+    return "The game disc file could not be read (" + path.filename().u8string() + ": " + why + "). Check that it is still "
+           "there, then choose it again on the launcher's Play page.";
+  }
   if (std::memcmp(head, "GALE01", 6) != 0) {
     if (size != kRetailSize)
       return "The game disc is a compressed or trimmed copy. These looks need the full 1.36 GB .iso: convert it to a "
@@ -7375,6 +7452,9 @@ std::string active_look_pack() {
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_look_pack;
 }
+
+std::atomic<bool> g_tool_recovery{true};   // set_tool_recovery: the host turns it off in the YouGame app
+void set_tool_recovery(bool allowed) { g_tool_recovery = allowed; }
 
 bool build_look_packs(const std::string& patcher_folder, const std::string& retail_disc, const std::string& xdelta_tool,
                       std::string* message) {
@@ -7523,6 +7603,7 @@ bool https_get(const std::string& url, const fs::path* out, std::string* text, u
 fs::path prepare_xdelta(const fs::path& preferred, bool recover, std::string* error) {
   std::error_code ec;
   if (!recover && !preferred.empty() && fs::is_regular_file(preferred, ec)) return preferred;
+  if (!g_tool_recovery.load()) { *error = "The patch tool that comes with the game could not be used."; return {}; }
   fs::path root;
   { std::lock_guard<std::mutex> lock(g_mutex); root = g_root; }
   if (root.empty()) { *error = "The cosmetic catalog is not ready to prepare the patch tool."; return {}; }

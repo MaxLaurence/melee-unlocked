@@ -96,6 +96,23 @@ int main(int argc, char** argv) {
   check(!download_matches("abd", abc), "a damaged download of the same size is refused");
   check(download_matches("anything", ""), "a release without a listed digest keeps the size check only");
 
+  // The releases feed (the fallback when GitHub's API refuses the check) carries each release's notes as
+  // escaped HTML; What's new showed "(no notes)" for all of them before (player report 11-21).
+  {
+    const std::string feed =
+        "<feed><entry><link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/Hero88go/melee-unlocked/releases/tag/v0.9.997\"/>"
+        "<updated>2026-11-22T00:22:33Z</updated><content type=\"html\">&lt;h2&gt;Install&lt;/h2&gt;\n&lt;p&gt;Download &lt;code&gt;x.zip&lt;/code&gt;.&lt;/p&gt;\n"
+        "&lt;p&gt;Video &amp;gt; Ray tracing&lt;/p&gt;\n&lt;h2&gt;Fixes&lt;/h2&gt;\n&lt;ul&gt;\n&lt;li&gt;&lt;strong&gt;The Lab view needs Ctrl+F3.&lt;/strong&gt; It&amp;#39;s off.&lt;/li&gt;\n"
+        "&lt;/ul&gt;\n&lt;p&gt;Includes everything from 0.9.996.&lt;/p&gt;</content></entry></feed>";
+    const std::string list = host::updater::releases_from_feed_for_test(feed);
+    check(list.find("\"tag_name\":\"v0.9.997\"") != std::string::npos, "the feed lists its release");
+    // A blank line after a heading, as in the API's Markdown body.
+    check(list.find("## Fixes\\n\\n- The Lab view needs Ctrl+F3. It's off.") != std::string::npos, "the feed's notes become What's new lines");
+    check(list.find("Video > Ray tracing") != std::string::npos, "escaped characters in the feed's notes come back");
+    check(list.find("&lt;") == std::string::npos && list.find("<p>") == std::string::npos, "no HTML is left in the notes");
+    check(list.find("Includes everything from 0.9.996.") != std::string::npos, "the last paragraph is kept");
+  }
+
   std::error_code ec;
   const fs::path root = fs::temp_directory_path() / ("mu-updater-test-" + std::to_string(GetCurrentProcessId()));
   fs::remove_all(root, ec);
@@ -219,17 +236,19 @@ int main(int argc, char** argv) {
     const auto present = [](const fs::path& p) {
       return GetFileAttributesW((L"\\\\?\\" + p.wstring()).c_str()) != INVALID_FILE_ATTRIBUTES;
     };
-    const fs::path folders[2] = {root / "play", root / "deep" / std::string(100, 'd') / "game"};
-    for (int i = 0; i < 2; ++i) {
+    // The third runs with a PATH that has no System32 (a player's did, 11-23: "'xcopy' is not recognized").
+    const fs::path folders[3] = {root / "play", root / "deep" / std::string(100, 'd') / "game", root / "nopath"};
+    for (int i = 0; i < 3; ++i) {
       const fs::path& folder = folders[i];
       fs::create_directories(folder, ec);
       { std::ofstream(folder / "melee_port.exe") << "old"; }
       fs::copy_file(package, folder / "update.zip", fs::copy_options::overwrite_existing, ec);
       // 999996 is no process: the script's waits fall straight through. The "relaunch" writes a file.
       const std::string script = host::updater::install_script(folder.u8string(), 999996ul, {999992ul},
-                                                               "/b cmd /c \"echo started> relaunched.txt\"", false);
+                                                               "/b %ComSpec% /c \"echo started> relaunched.txt\"", false);
       { std::ofstream b(folder / "update.bat", std::ios::binary); b << script; }
-      std::wstring cmd = L"cmd /c \"\"" + (folder / "update.bat").wstring() + L"\"\"";
+      std::wstring cmd = i == 2 ? L"cmd /c \"set PATH=C:\\nowhere&& \"" + (folder / "update.bat").wstring() + L"\"\""
+                              : L"cmd /c \"\"" + (folder / "update.bat").wstring() + L"\"\"";
       STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
       const bool started = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
                                           folder.wstring().c_str(), &si, &pi);
@@ -237,7 +256,7 @@ int main(int argc, char** argv) {
       for (int wait = 0; wait < 50 && !present(folder / "relaunched.txt"); ++wait) Sleep(100);
       std::string exe_text;
       { std::ifstream in(folder / "melee_port.exe"); in >> exe_text; }
-      const char* where = i ? "deep folder" : "short folder";
+      const char* where = i == 2 ? "folder updated without System32 on the PATH" : i ? "deep folder" : "short folder";
       std::printf("%s: path of the long file is %zu characters\n", where, (folder / "Shaders" / long_name).wstring().size());
       check(started && exe_text == "new", "install script replaces the program");
       check(present(folder / "Shaders" / long_name), "install script copies the file with the long name");

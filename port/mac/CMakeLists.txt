@@ -163,6 +163,9 @@ target_include_directories(mac_runtime PRIVATE "${MELEE_MAC_DEPS}/include" "${PO
 # The companion's pages (runtime/gx/companion.h): no second screen on a Mac, but MELEE_COMPANION_PREVIEW=1
 # shows them beside the game for development.
 target_compile_definitions(mac_runtime PUBLIC MELEE_COMPANION)
+# Squad Strike, as the Windows and Linux hosts build it (on in every release since 0.9.990).
+include("${PORT}/cmake/squad.cmake")
+mu_squad_target(mac_runtime)
 foreach(lib avformat avcodec swscale swresample avutil)
   target_link_libraries(mac_runtime PUBLIC "${MELEE_MAC_DEPS}/lib/lib${lib}.a")
 endforeach()

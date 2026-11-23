@@ -53,8 +53,27 @@ inline bool dualsense_pad(unsigned long vendor, unsigned long product) {
 constexpr int8_t kTriggerRestMin = 0, kTriggerRestCentre = 1, kTriggerRestMax = 2;
 int8_t hid_trigger_rest(long logical_min, long logical_max, long raw);
 uint8_t hid_trigger_value(long logical_min, long logical_max, long raw, int8_t rest);
+// The trigger's origin taken off, as the console's pad library does when it reads a controller (the
+// game's own clamp takes nothing off): the lowest value seen, at most 64 (a trigger held when the pad
+// appeared), starting from the first. `origin` is the pad's own, kTriggerOriginUnknown at first.
+constexpr uint8_t kTriggerOriginUnknown = 255, kTriggerOriginMax = 64;
+inline uint8_t hid_trigger_from_origin(uint8_t value, uint8_t* origin) {
+  if (*origin == kTriggerOriginUnknown) *origin = value < kTriggerOriginMax ? value : kTriggerOriginMax;
+  else if (value < *origin) *origin = value;
+  return value > *origin ? (uint8_t)(value - *origin) : 0;
+}
 // A stick axis as the reader turns it into the pad's signed value (floored, no deadzone), for tests.
 int8_t hid_axis_signed(long logical_min, long logical_max, long raw, bool flip = false);
+
+// How a stick field's raw bits carry its value. As declared (the default), or, for a device whose
+// descriptor and data disagree, the field's bits as two's complement or as offset binary around the
+// field's middle. A B0XX r2 on firmware v3 read in the bottom-right corner at rest on both sticks and
+// could not bind a stick direction (player report 11-21): its range is not what its data is. Decided
+// per axis from the first report, where a box's stick is at rest: the declared reading unless it is far
+// from the centre and another reading is near it. Frame1 has its own (frame1_stick_encoding).
+constexpr int8_t kStickDeclared = 0, kStickTwos = 1, kStickOffset = 2;
+int8_t hid_stick_value(long logical_min, long logical_max, int bits, unsigned long raw, int8_t encoding, bool flip = false);
+int8_t hid_stick_encoding(long logical_min, long logical_max, int bits, unsigned long rest);
 
 // HayBox in its DInput mode, the firmware of the Frame1 and many other box controllers, describes six
 // 16-bit axes (X, Y, Z, Rz, Rx, Ry), a hat and buttons 1-16, and publishes no name of its own (on a
@@ -126,5 +145,38 @@ std::string hidpad_name(int slot);
 // watching the raw numbers while moving the stick, so the panel shows them.
 struct HidPadAxes { int32_t value[8]; const char* name[8]; int count; };
 HidPadAxes hidpad_axes(int slot);
+
+// Choosing an axis by moving it (g_hid_axis_role). `base` and `now` are every axis as a stick value
+// (-128..127 over its range), `present` a bit per axis. The axis that moved furthest, when that is at
+// least kHidAxisMoved (a light shield button moves a trigger axis about a fifth of its range, and a
+// resting stick's jitter is far below that), or -1. The hat (index 7) is never an answer.
+constexpr int kHidAxisMoved = 32;
+inline int hid_moved_axis(const int8_t base[8], const int8_t now[8], unsigned present) {
+  int best = -1, most = 0;   // not "far": windows.h defines that away
+  for (int i = 0; i < 7; ++i) {
+    if (!((present >> i) & 1u)) continue;
+    const int d = (int)now[i] - (int)base[i], a = d < 0 ? -d : d;
+    if (a > most) { most = a; best = i; }
+  }
+  return most >= kHidAxisMoved ? best : -1;
+}
+// Which axis a role reads: the player's choice when that axis exists, otherwise the reader's own
+// (`automatic`, -1 for none) unless the player gave that axis to another role.
+inline int hid_role_axis(const uint8_t roles[6], int role, int automatic, unsigned present) {
+  const uint8_t chosen = roles[role];
+  if (chosen < 7 && ((present >> chosen) & 1u)) return chosen;
+  for (int r = 0; r < 6; ++r)
+    if (r != role && automatic >= 0 && roles[r] == automatic) return -1;
+  return automatic;
+}
+// Remembers where every axis of the pad is now; the poll then answers with the axis moved since
+// (hid_moved_axis), -1 while none has. Not offered for a Frame1, which has a reader of its own.
+void hidpad_axis_capture_begin(int slot);
+int hidpad_axis_capture_poll(int slot);
+// Gives `axis` to `role` (HID_ROLE_*) for this pad, taking it from any role that had it. The pad is
+// expected to be held where the capture found it: right or up for a stick, which sets or clears that
+// direction's invert switch so the push reads the way it was made; a trigger rests where the capture began.
+void hidpad_assign_axis(int slot, int role, int axis);
+const char* hidpad_axis_name(int slot, int axis);
 
 }  // namespace host

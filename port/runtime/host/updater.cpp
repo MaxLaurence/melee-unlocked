@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "updater.h"
+#include "updater_check_retry.h"
 #include "host.h"
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -10,6 +11,7 @@
 #include <winhttp.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,10 @@
 #define STBI_NO_STDIO
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
+// Not in the Linux build's Windows stand-in headers (the Windows half of this file is compiled there too).
+#ifndef CREATE_BREAKAWAY_FROM_JOB
+#define CREATE_BREAKAWAY_FROM_JOB 0x01000000
+#endif
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -38,6 +44,8 @@ namespace {
 // The release list rather than /releases/latest: that endpoint skips pre-releases (betas).
 const char* REPO_API = "https://api.github.com/repos/hero88go/melee-unlocked/releases?per_page=100";
 std::atomic<State> g_state{State::Idle};
+std::atomic<bool> g_check_failed{false};   // the last Failed came from the release check, not a download
+std::atomic<bool> g_stopping{false};       // shutdown(): a check waiting to ask again stops waiting
 std::mutex g_mutex;
 std::string g_current, g_latest, g_zip_url, g_message, g_zip_path, g_zip_digest;
 size_t g_zip_size = 0;
@@ -496,19 +504,147 @@ bool unpack_tar_gz(const std::filesystem::path& archive, const std::filesystem::
   }
   return true;
 }
+
+// GitHub's API answers 60 requests an hour per internet address without sign-in, and a check takes two (the
+// list is longer than one page). Players who share an address (a mobile or a carrier network, a house of
+// players) ran out and their update check failed with HTTP 403 (player report 11-20). The releases feed on
+// github.com itself has no such limit: its ten newest releases, turned into the API's shape with this
+// platform's download at its usual address (no size or digest: the API alone lists those).
+constexpr const char* kReleasesFeed = "https://github.com/hero88go/melee-unlocked/releases.atom";
+// &lt; &gt; &quot; &apos; &amp; and &#NN; (ASCII) back to their characters; anything else stays as written.
+std::string unescape_entities(const std::string& s) {
+  static const std::pair<const char*, char> kNamed[] = {{"&lt;", '<'}, {"&gt;", '>'}, {"&quot;", '"'}, {"&apos;", '\''}, {"&amp;", '&'}};
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size();) {
+    if (s[i] == '&') {
+      bool done = false;
+      for (const auto& [name, c] : kNamed)
+        if (s.compare(i, std::strlen(name), name) == 0) { out += c; i += std::strlen(name); done = true; break; }
+      if (!done && i + 3 < s.size() && s[i + 1] == '#') {
+        const size_t semi = s.find(';', i);
+        if (semi != std::string::npos && semi - i <= 6) {
+          const int code = std::atoi(s.c_str() + i + 2);
+          if (code > 0 && code < 128) { out += (char)code; i = semi + 1; done = true; }
+        }
+      }
+      if (done) continue;
+    }
+    out += s[i++];
+  }
+  return out;
+}
+// The feed's notes are the release page's HTML (escaped once more for the feed). What's new reads the API's
+// Markdown, so this turns them back into those lines: "## " headings, "- " list items, plain paragraphs. The
+// feed alone used to come with no notes, so a player whose check fell back to it saw "(no notes)" for every
+// release (player report 11-21).
+std::string notes_from_feed_html(const std::string& escaped) {
+  const std::string html = unescape_entities(escaped);
+  std::string text;
+  for (size_t i = 0; i < html.size();) {
+    if (html[i] != '<') { text += html[i++]; continue; }
+    const size_t close = html.find('>', i);
+    if (close == std::string::npos) break;
+    std::string tag = html.substr(i + 1, close - i - 1);
+    i = close + 1;
+    const bool closing = !tag.empty() && tag[0] == '/';
+    if (closing) tag.erase(0, 1);
+    std::string name = tag.substr(0, tag.find_first_of(" \t/"));
+    for (char& c : name) c = (char)std::tolower((unsigned char)c);
+    const bool heading = name.size() == 2 && name[0] == 'h' && name[1] >= '1' && name[1] <= '6';
+    if (!closing && heading) { if (!text.empty() && text.back() != '\n') text += '\n'; text += "## "; }
+    else if (!closing && name == "li") { if (!text.empty() && text.back() != '\n') text += '\n'; text += "- "; }
+    else if (name == "br" || (closing && (heading || name == "p" || name == "li" || name == "ul" || name == "ol"))) text += '\n';
+  }
+  text = unescape_entities(text);
+  std::string out;   // at most one empty line in a row
+  for (char c : text) {
+    if (c == '\r') continue;
+    if (c == '\n' && out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n') continue;
+    out += c;
+  }
+  while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+  while (!out.empty() && out.front() == '\n') out.erase(0, 1);
+  return out;
+}
+std::string releases_from_feed(const std::string& feed) {
+  nlohmann::json list = nlohmann::json::array();
+  const std::string marker = "/releases/tag/";
+  for (size_t at = feed.find("<entry>"); at != std::string::npos; at = feed.find("<entry>", at + 7)) {
+    const size_t end = feed.find("</entry>", at);
+    if (end == std::string::npos) break;
+    const std::string entry = feed.substr(at, end - at);
+    const size_t t = entry.find(marker);
+    if (t == std::string::npos) continue;
+    const size_t t_end = entry.find('"', t);
+    if (t_end == std::string::npos) continue;
+    const std::string tag = entry.substr(t + marker.size(), t_end - t - marker.size());
+    if (tag.size() < 2 || tag[0] != 'v' || !safe_version(tag.substr(1))) continue;
+    std::string updated;
+    const size_t u = entry.find("<updated>");
+    if (u != std::string::npos) updated = entry.substr(u + 9, 20);
+    std::string notes;
+    const size_t c = entry.find("<content");
+    const size_t c_open = c == std::string::npos ? c : entry.find('>', c);
+    const size_t c_end = c_open == std::string::npos ? c_open : entry.find("</content>", c_open);
+    if (c_end != std::string::npos) notes = notes_from_feed_html(entry.substr(c_open + 1, c_end - c_open - 1));
+    const std::string name = "MeleeUnlocked-" + tag.substr(1) + kPlatformAsset;
+    list.push_back({{"tag_name", tag}, {"published_at", updated}, {"body", notes},
+                    {"assets", nlohmann::json::array({{{"name", name},
+                        {"browser_download_url", "https://github.com/Hero88go/melee-unlocked/releases/download/" + tag + "/" + name}}})}});
+  }
+  return list.empty() ? std::string() : list.dump();
+}
 }  // namespace
+
+std::string releases_from_feed_for_test(const std::string& feed) { return releases_from_feed(feed); }
 
 void check(const std::string& current_version, bool install_experimental) {
   join();
   g_current = current_version;
+  // The launcher's own check (not the Retry after a failed one) asks again quietly before it reports a failure
+  // (updater_check_retry.h): on a fresh install its first ask can come before the network or GitHub answers.
+  const bool quiet = g_state.load() != State::Failed;
+  g_check_failed = false;
   g_state = State::Checking;
-  g_thread = std::thread([install_experimental] {
+  g_thread = std::thread([install_experimental, quiet] {
     std::string body; int status = 0;
-    if (!http_get(REPO_API, &body, &status) || status != 200) { set_message(status ? "Update check failed (HTTP " + std::to_string(status) + ")" : "Update check failed (no connection)"); host::log("updater: GET %s failed, HTTP %d, error %lu", REPO_API, status, (unsigned long)GetLastError()); g_state = State::Failed; return; }
-    auto list = nlohmann::json::parse(body, nullptr, false);
+    // GitHub's API first. A miss (no network yet, a timeout, GitHub busy, or its hourly limit per internet
+    // address: 403/429) tries the releases feed on github.com, which has no such limit (releases_from_feed);
+    // only when both miss does the launcher's own check ask again quietly (updater_check_retry.h).
+    bool from_feed = false;
+    nlohmann::json list;
+    for (int failures = 0;;) {
+      body.clear(); status = 0;
+      const bool answered = http_get(REPO_API, &body, &status) && status == 200;
+      const unsigned long error = GetLastError();
+      if (answered) {
+        list = nlohmann::json::parse(body, nullptr, false);
+        if (list.is_array()) break;
+      }
+      std::string feed; int feed_status = 0;
+      std::string from_feed_body;
+      if (http_get(kReleasesFeed, &feed, &feed_status) && feed_status == 200 &&
+          !(from_feed_body = releases_from_feed(feed)).empty()) {
+        host::log("updater: GET %s failed, HTTP %d: the newest releases come from the releases feed instead", REPO_API, status);
+        list = nlohmann::json::parse(from_feed_body, nullptr, false);
+        from_feed = true;
+        break;
+      }
+      const int wait = check_retry::delay_ms(++failures, quiet);
+      host::log("updater: GET %s failed (ask %d), HTTP %d, error %lu%s%s", REPO_API, failures, status, error,
+                answered ? ", not a release list" : "", wait < 0 ? "" : "; asking again shortly");
+      for (int waited = 0; waited < wait && !g_stopping.load(); waited += 100) Sleep(100);
+      if (wait < 0 || g_stopping.load()) {
+        set_message(check_retry::failed_text(answered ? 200 : status));
+        g_check_failed = true;
+        g_state = State::Failed;
+        return;
+      }
+    }
     // GitHub gives at most 100 releases a page: the older ones (157 by 0.9.200) are on the next
     // pages, and the version picker lists every release. A page that fails only shortens the list.
-    for (int page = 2; list.is_array() && list.size() == (size_t)(page - 1) * 100 && page <= 20; ++page) {
+    for (int page = 2; !from_feed && list.is_array() && list.size() == (size_t)(page - 1) * 100 && page <= 20; ++page) {
       std::string more; int more_status = 0;
       const std::string url = std::string(REPO_API) + "&page=" + std::to_string(page);
       if (!http_get(url.c_str(), &more, &more_status) || more_status != 200) { host::log("updater: GET %s failed, HTTP %d", url.c_str(), more_status); break; }
@@ -538,7 +674,7 @@ void check(const std::string& current_version, bool install_experimental) {
       if (d.release.legacy || d.release.experimental) catalog.push_back(std::move(d));
       if (!j.is_object()) j = r;
     }
-    if (!j.is_object()) { set_message("Update check failed (bad response)"); g_state = State::Failed; return; }
+    if (!j.is_object()) { set_message(check_retry::failed_text(200)); g_check_failed = true; g_state = State::Failed; return; }
     host::log("updater: %zu releases on GitHub, %zu with a download for this platform", list.is_array() ? list.size() : (size_t)0, catalog.size());
     std::string tag = j["tag_name"].get<std::string>();
     if (!tag.empty() && tag[0] == 'v') tag.erase(0, 1);
@@ -617,6 +753,7 @@ std::vector<unsigned long> install_processes(const std::string& install_root_utf
 
 void shutdown();   // below, with the DLSS 5 model download it also waits for
 State state() { return g_state.load(); }
+bool check_failed() { return g_state.load() == State::Failed && g_check_failed.load(); }
 std::string latest_version() { std::lock_guard<std::mutex> lk(g_mutex); return g_latest; }
 std::string message() { std::lock_guard<std::mutex> lk(g_mutex); return g_message; }
 std::vector<Release> releases() { std::lock_guard<std::mutex> lk(g_mutex); std::vector<Release> out; for (const auto& d : g_releases) out.push_back(d.release); return out; }
@@ -695,7 +832,7 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
   // waited for a key nobody could press, and the player saw an update that never finished.
   const auto failed = [show_failure](const char* what) {
     if (!show_failure) return std::string("exit /b 1\r\n");   // the unit test: never a window
-    return std::string("start \"Melee Unlocked update\" cmd /k \"echo ") + what +
+    return std::string("start \"Melee Unlocked update\" %SystemRoot%\\System32\\cmd.exe /k \"echo ") + what +
            " & echo Close the game and any open Explorer window on this folder, then update again."
            " & echo Details: update.log in the game folder.\"\r\nexit /b 1\r\n";
   };
@@ -703,14 +840,32 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
   b << "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\ncd /d \"" << batch_dir << "\" || exit /b 1\r\n"
     << "set LOG=\"" << batch_dir << "\\update.log\"\r\n"
     << "echo update started %DATE% %TIME%> %LOG%\r\n"
-    << ":wait\r\ntasklist /FI \"PID eq " << self << "\" 2>nul | find \"" << self << "\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
-    << ":waitgame\r\n";
+    << "set WAITS=0\r\n";
+  // Each wait has an end. A launcher or game from this folder that hung on its way out (no window,
+  // still running) used to hold the script here forever: the update never copied, nothing said so,
+  // and the next start offered the same update again. After the limit the process is ended, and only
+  // when it is still one of ours (an image name starting with "melee", which covers every program in
+  // the release): a number Windows gave to some other program since is left alone.
+  // A second waits with ping when timeout cannot (it refuses to run without a console input).
+  const auto wait_for = [&b](const char* label, unsigned long pid, int seconds, const char* what) {
+    b << ":" << label << "\r\n"
+      << "%SystemRoot%\\System32\\tasklist.exe /FI \"PID eq " << pid << "\" 2>nul | %SystemRoot%\\System32\\find.exe \"" << pid << "\" >nul || goto " << label << "_done\r\n"
+      << "set /a WAITS+=1\r\n"
+      << "if %WAITS% geq " << seconds << " (echo " << what << " " << pid << " had not closed after " << seconds
+      << " s, ending it>> %LOG% & %SystemRoot%\\System32\\taskkill.exe /F /FI \"PID eq " << pid << "\" /FI \"IMAGENAME eq melee*\" >> %LOG% 2>&1"
+      << " & set WAITS=0 & (%SystemRoot%\\System32\\timeout.exe /t 2 /nobreak >nul 2>&1 || %SystemRoot%\\System32\\PING.EXE -n 3 127.0.0.1 >nul) & goto " << label << "_done)\r\n"
+      << "%SystemRoot%\\System32\\timeout.exe /t 1 /nobreak >nul 2>&1 || %SystemRoot%\\System32\\PING.EXE -n 2 127.0.0.1 >nul\r\n"
+      << "goto " << label << "\r\n"
+      << ":" << label << "_done\r\n"
+      << "set WAITS=0\r\n";
+  };
+  wait_for("wait", self, 30, "the launcher");
   // Source also holds the DLL open. Wait for both engines and other launchers
-  // from this folder, without blocking on games in unrelated installations.
+  // from this folder, without blocking on games in unrelated installations. A game still being
+  // played gets longer to close than a launcher that is already on its way out.
+  int n = 0;
   for (const auto pid : others)
-    if (pid != self)
-      b << "tasklist /FI \"PID eq " << pid << "\" 2>nul | find \"" << pid
-        << "\" >nul && (timeout /t 1 /nobreak >nul & goto waitgame)\r\n";
+    if (pid != self) wait_for(("waitgame" + std::to_string(n++)).c_str(), pid, 60, "a game");
   // The launcher normally unpacks update.zip into update_tmp itself (Wine and Proton have no tar)
   // and leaves update_tmp\unpacked.txt; tar is only the fallback for an older handover.
   b << "if exist update_tmp\\unpacked.txt goto findsrc\r\n"
@@ -737,15 +892,17 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
     << "set TRIES=0\r\n"
     << ":copy\r\n"
     << "set /a TRIES+=1\r\n"
-    << "attrib -r \"*.*\" /s >nul 2>&1\r\n"
-    << "xcopy /e /y /q /r \"%SRC%\\*\" \".\\\" >> %LOG% 2>&1\r\n"
+    // Every Windows tool by its full path: a PATH without System32 (a player's, 11-23) answered
+    // "'xcopy' is not recognized" five times, then the same for robocopy, and the update never copied.
+    << "%SystemRoot%\\System32\\attrib.exe -r \"*.*\" /s >nul 2>&1\r\n"
+    << "%SystemRoot%\\System32\\xcopy.exe /e /y /q /r \"%SRC%\\*\" \".\\\" >> %LOG% 2>&1\r\n"
     << "if not errorlevel 1 goto copied\r\n"
-    << "if %TRIES% lss 5 (echo copy attempt %TRIES% failed, retrying>> %LOG% & timeout /t 2 /nobreak >nul & goto copy)\r\n"
+    << "if %TRIES% lss 5 (echo copy attempt %TRIES% failed, retrying>> %LOG% & (%SystemRoot%\\System32\\timeout.exe /t 2 /nobreak >nul 2>&1 || %SystemRoot%\\System32\\PING.EXE -n 3 127.0.0.1 >nul) & goto copy)\r\n"
     // xcopy stops at the first path of 255 characters or more (a deep game folder and a long file
     // name inside the release), leaving the folder half updated. robocopy copies those too; its exit
     // codes below 8 mean every file is in place.
     << "echo copy failed after %TRIES% attempts, trying robocopy>> %LOG%\r\n"
-    << "robocopy \"%SRC%\" \".\" /E /IS /IT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
+    << "%SystemRoot%\\System32\\Robocopy.exe \"%SRC%\" \".\" /E /IS /IT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
     << "if not errorlevel 8 goto copied\r\n"
     << "echo robocopy failed too>> %LOG%\r\n"
     << failed("Could not copy the update into place.")
@@ -890,7 +1047,11 @@ void download_and_install() {
     STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
     // Doubled quotes: cmd strips one layer, and the path contains spaces.
     std::wstring cmd = L"cmd /c \"\"" + bat.wstring() + L"\"\"";
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &si, &pi)) {
+    // Outside any job the launcher was started in: a job that ends its processes when it closes ended
+    // the installer together with the launcher. A job that allows no breakaway refuses the flag.
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                        directory.c_str(), &si, &pi) &&
+        !CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &si, &pi)) {
       set_message("Cannot start update installer"); g_state = State::Failed; return;
     }
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -1469,6 +1630,7 @@ ModelState xess_state(const std::string& game_dir_utf8) {
 std::string xess_message() { return part_message(g_xess); }
 
 void shutdown() {
+  g_stopping = true;   // a check waiting to ask again (check_retry) ends now instead of holding the exit
   join();
   if (g_rollback_thread.joinable()) g_rollback_thread.join();
   if (g_model_thread.joinable()) g_model_thread.join();

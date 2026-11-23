@@ -28,10 +28,11 @@ DEPLOY=13.0; [ "$ARCH" = x86_64 ] && DEPLOY=15.0
 cmake -S . -B "$BUILD" -G Ninja -DMELEE_BUILD_MAC=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=$DEPLOY -DMELEE_PORT_GEN="$GEN/port-generated" -DMELEE_MAC_DEPS="$ROOT/build-mac-deps/$ARCH" \
   -DMELEE_MAC_GAME_LIBRARY="$ROOT/build-mac-game/$ARCH/melee_game.so" >/dev/null
-cmake --build "$BUILD"
+# The app only: the root project's unit tests are built and run by the Windows and Linux checks.
+cmake --build "$BUILD" --target mac_app
 echo "[6/6] Shader seed (hidden runs of the game; once)"
 if [ ! -f "$GEN/shader-seed/gx-metal-v1/recipes.bin" ]; then
   python3 port/mac/make_shader_seed.py --app "$BUILD/MeleeUnlocked.app" --iso "$ISO" --out "$GEN/shader-seed"
-  cmake --build "$BUILD"   # packages the seed
+  cmake --build "$BUILD" --target mac_app   # packages the seed
 fi
 echo "Done: $BUILD/MeleeUnlocked.app"

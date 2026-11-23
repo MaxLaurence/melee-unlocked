@@ -24,7 +24,8 @@ std::chrono::steady_clock::time_point g_next_scan{};
 bool g_ready = false;
 
 bool skipped(uint16_t vendor, uint16_t product) {
-  return vendor == 0x057E && product == 0x0337;   // Nintendo's Wii U / Switch GameCube adapter
+  return (vendor == 0x057E && product == 0x0337) ||   // Nintendo's Wii U / Switch GameCube adapter
+         (vendor == 0x2E8A && product == 0x102B);     // the Lossless adapter in its lag-test mode
 }
 
 void ensure_init() {
@@ -61,7 +62,7 @@ void rescan_locked() {
     free_slot->pad = pad; free_slot->id = id; free_slot->vendor = vendor; free_slot->product = product;
     const char* name = SDL_GameControllerName(pad);
     free_slot->name = name ? name : "Controller";
-    // The pad's id and SDL type only, never its name (names can be user-set; pack-platform).
+    // The pad's id and SDL type only, never its name (names can be user-set).
     host::log("pads: slot %d <- vid:pid %04X:%04X type %d", int(free_slot - g_slots), unsigned(vendor), unsigned(product),
               int(SDL_GameControllerGetType(pad)));
   }

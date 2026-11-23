@@ -22,7 +22,11 @@ docker run --rm -v "$ROOT":/src -w /src $IMAGE bash -c "
   set -e
   cmake -S sourceport/game -B build-android-game/obj -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-14 \
     -DCMAKE_CXX_COMPILER=g++-14 -DMU_WINDOW_BASE=$BASE -DCMAKE_C_FLAGS='$FLAGS' -DCMAKE_CXX_FLAGS='$FLAGS' >/dev/null
-  cmake --build build-android-game/obj --target melee_game -j \$(nproc) | grep -v '^\[' || true
+  # A failed compile must stop here: an older melee_game.so would otherwise pass the check below.
+  status=0
+  cmake --build build-android-game/obj --target melee_game -j \$(nproc) > build-android-game/build.log 2>&1 || status=\$?
+  grep -v '^\[' build-android-game/build.log || true
+  [ \$status -eq 0 ] || { echo 'The game library did not build (see above)'; exit \$status; }
   test -f build-android-game/obj/melee_game.so
   cp build-android-game/obj/melee_game.so build-android-game/melee_game.so
   if [ -f build-android-game/obj/melee_game.snapexcl ]; then cp build-android-game/obj/melee_game.snapexcl build-android-game/; fi"

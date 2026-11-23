@@ -1,6 +1,7 @@
 // Synthetic fixtures and shipped manifest. No disc, game process, network or external delta encoder.
 #include "sysgen.h"
 #include "vcdiff.h"
+#include <map>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,9 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using Bytes = std::vector<uint8_t>;
 using Json = nlohmann::json;
@@ -16,6 +20,10 @@ static void check(bool ok, const std::string& message) {
   if (!ok) { std::cerr << "FAIL: " << message << '\n'; std::exit(1); }
 }
 static Bytes bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
+static Bytes read_all(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return Bytes(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
 static void append(Bytes& a, const Bytes& b) { a.insert(a.end(), b.begin(), b.end()); }
 static void integer(Bytes& out, size_t n) {
   if (n >= 128) integer(out, n >> 7);
@@ -150,8 +158,16 @@ static void shipped_manifest_tests() {
     check(fs::file_size(delta) > 0, "shipped delta is nonempty: " + delta.string());
   }
   std::sort(targets.begin(), targets.end());
-  check(targets == std::vector<std::string>{"GameSetup_gui.dat", "slpCSS.dat"},
-        "shipped manifest contains exactly the two required targets");
+  check(targets == std::vector<std::string>{"GameSetup_gui.dat", "SlippiCSS_gui.dat", "slpCSS.dat"},
+        "shipped manifest contains exactly the three required targets");
+  // Pinned to upstream v0.9.207 (Slippi 3.7.0, e6478b848): a new upstream Sys file needs new deltas
+  // (make_sys_deltas.py --targets-rev <tag>), never a stale rebuild of the old one.
+  const std::map<std::string, std::string> upstream = {
+      {"GameSetup_gui.dat", "cb78574af8b6ceede7890d4a6a74d61afefdd8df"},
+      {"slpCSS.dat", "c70c600663ded2fefe11aeb439f3e61125273651"},
+      {"SlippiCSS_gui.dat", "c613efa143e9efb6effeb98aa6f8650243f88977"}};
+  for (const auto& file : files)
+    check(upstream.count(file.target) && upstream.at(file.target) == file.sha1, "shipped target is upstream 3.7.0's: " + file.target);
 }
 static void applier_tests(const fs::path& root) {
   const Bytes target = bytes("hello"), source = bytes("disc"), second_source = bytes("extra");
@@ -191,6 +207,7 @@ static void applier_tests(const fs::path& root) {
   for (const auto* folder : {"Sys", "SysPlayback", "slippi_sys_general"}) {
     write(build / folder / "GameFiles/GALE01/GameSetup_gui.dat", target);
     write(build / folder / "GameFiles/GALE01/slpCSS.dat", bytes("staging"));
+    write(build / folder / "GameFiles/GALE01/SlippiCSS_gui.dat", bytes("staging"));
   }
   check(assets.prepare(config, disc, error), "staging without manifest: " + error);
   check(assets.status_message().empty(), "no manifest produces no status message");
@@ -213,10 +230,11 @@ static void applier_tests(const fs::path& root) {
   cached_message(3);
   check(assets.lookup(sys / "", "GameSetup_gui.dat") == data / "SysGenerated/Sys/GameSetup_gui.dat",
         "trailing slash lookup redirects");
+  // A stale cache (an older build's generated file, or a damaged one) is rebuilt from the disc and replaced.
   write(data / "SysGenerated/Sys/GameSetup_gui.dat", bytes("wrong"));
-  check(!assets.prepare(config, disc, error) && error.find("generated file") != std::string::npos, "modified cache fails closed");
-  check(assets.generated_names(sys).empty(), "failure publishes no redirects");
-  check(assets.status_message().empty(), "failure publishes no success message");
+  check(assets.prepare(config, disc, error) && reads == 2, "stale cache rebuilt from the disc: " + error);
+  check(read_all(data / "SysGenerated/Sys/GameSetup_gui.dat") == target, "stale cache replaced with the target");
+  check(assets.lookup(sys, "GameSetup_gui.dat") == data / "SysGenerated/Sys/GameSetup_gui.dat", "rebuilt cache redirect");
   clean_generated(); disc_bytes = bytes("oops");
   check(!assets.prepare(config, disc, error) && error.find("disc source size/SHA-1") != std::string::npos, "modified disc fails closed");
   disc_bytes = source; readable = false;
@@ -241,6 +259,25 @@ static void applier_tests(const fs::path& root) {
   check(!assets.prepare(bad_config, disc, error), "no writable data location fails closed");
   bad_config.data_dir = build / "User";
   check(!assets.prepare(bad_config, disc, error), "never writes inside build");
+  // The Linux zip's launcher passes --user-dir <build>/User/Slippi: boot generates into the player's own
+  // folder instead of failing the start. An explicit --sysgen-data-dir inside the build still fails.
+  {
+    std::string note;
+    auto moved = config;
+    const auto player = root / "player-data/User";
+    moved.data_dir = host::sysgen::choose_data_dir(build, (build / "User/Slippi").u8string(), "", player, note);
+    check(moved.data_dir == player && assets.prepare(moved, disc, error) &&
+          fs::is_regular_file(player / "SysGenerated/Sys/GameSetup_gui.dat") &&
+          assets.lookup(sys, "GameSetup_gui.dat") == player / "SysGenerated/Sys/GameSetup_gui.dat",
+          "user dir inside the build generates into the player's folder: " + error);
+    check(!fs::exists(build / "User"), "nothing written inside the build");
+    moved.data_dir = host::sysgen::choose_data_dir(build, (build / "User/Slippi").u8string(),
+                                                   (build / "User").u8string(), player, note);
+    check(moved.data_dir == build / "User" && note.empty() && !assets.prepare(moved, disc, error) &&
+          error.find("generated data must be outside the build directory") != std::string::npos,
+          "explicit --sysgen-data-dir inside the build still fails: " + error);
+    fs::remove_all(root / "player-data");
+  }
   write(root / "blocked-data", bytes("file, not directory"));
   bad_config.data_dir = root / "blocked-data";
   check(!assets.prepare(bad_config, disc, error) && error.find("atomically write") != std::string::npos,
@@ -278,10 +315,62 @@ static void applier_tests(const fs::path& root) {
   j["files"][0]["sys"] = {"SysPlayback"}; save_manifest();
   check(!assets.prepare(config, disc, error), "omitted active directory fails closed");
 }
+// Which folder boot hands prepare: explicit wins, a --user-dir parent inside the game folder (or no
+// --user-dir) moves to the player's own folder, one outside stays.
+static void data_dir_tests(const fs::path& root) {
+  const auto build = root / "pick/build", player = root / "pick/player/User";
+  fs::create_directories(build / "Sys");
+  std::string note;
+  auto pick = [&](const fs::path& user, const std::string& data, const fs::path& fallback) {
+    return host::sysgen::choose_data_dir(build, user.empty() ? std::string() : user.u8string(), data, fallback, note);
+  };
+  check(pick(build / "User/Slippi", "", player) == player &&
+        note == "sys: " + (build / "User").lexically_normal().u8string() + " is inside the game folder; generating into " + player.u8string(),
+        "user dir inside the build moves to the player's folder: " + note);
+  check(pick(build / "User/Slippi/", "", player) == player, "trailing slash inside the build moves too");
+  check(pick(build / "Slippi", "", player) == player, "user dir directly in the build: its parent is the build");
+  check(pick(root / "pick/home/User/Slippi", "", player) == root / "pick/home/User" && note.empty(),
+        "user dir outside the build keeps its parent");
+  check(pick({}, (build / "User").u8string(), player) == build / "User" && note.empty(),
+        "explicit data dir is never moved, even inside the build");
+  check(pick(build / "User/Slippi", (root / "pick/elsewhere").u8string(), player) == root / "pick/elsewhere",
+        "explicit data dir wins over user dir");
+  check(pick({}, "", player) == player && note == "sys: no --user-dir given; generating into " + player.u8string(),
+        "no user dir and no data dir uses the player's folder: " + note);
+  check(pick(build / "User/Slippi", "", {}) == build / "User" && note.empty(),
+        "no player folder keeps the old answer for prepare to refuse");
+  check(pick({}, "", {}).empty(), "nothing at all stays empty");
+  // The per-OS folder itself.
+#ifdef _WIN32
+  SetEnvironmentVariableW(L"LOCALAPPDATA", L"C:\\Users\\p\\AppData\\Local");
+  check(host::sysgen::user_data_dir() == fs::path(L"C:\\Users\\p\\AppData\\Local\\MeleeUnlocked-YouGame\\User"),
+        "Windows folder is LOCALAPPDATA's MeleeUnlocked-YouGame\\User");
+#else
+#ifdef __APPLE__
+  const std::string name = "melee-unlocked";
+#else
+  const std::string name = "MeleeUnlocked-YouGame";
+#endif
+  const char* old_xdg = std::getenv("XDG_DATA_HOME");
+  const char* old_home = std::getenv("HOME");
+  const std::string saved_xdg = old_xdg ? old_xdg : "", saved_home = old_home ? old_home : "";
+  setenv("HOME", "/home/p", 1);
+  setenv("XDG_DATA_HOME", "/data/p", 1);
+  check(host::sysgen::user_data_dir() == fs::path("/data/p") / name / "User", "XDG_DATA_HOME folder");
+  setenv("XDG_DATA_HOME", "relative", 1);
+  check(host::sysgen::user_data_dir() == fs::path("/home/p/.local/share") / name / "User", "relative XDG_DATA_HOME ignored");
+  unsetenv("XDG_DATA_HOME");
+  check(host::sysgen::user_data_dir() == fs::path("/home/p/.local/share") / name / "User", "HOME's .local/share folder");
+  unsetenv("HOME");
+  check(host::sysgen::user_data_dir().empty(), "no HOME and no XDG_DATA_HOME gives no folder");
+  if (old_home) setenv("HOME", saved_home.c_str(), 1);
+  if (old_xdg) setenv("XDG_DATA_HOME", saved_xdg.c_str(), 1);
+#endif
+}
 int main() {
   const auto root = fs::temp_directory_path() / ("mu-sysgen-test-" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{root};
-  decoder_tests(); manifest_tests(); shipped_manifest_tests(); applier_tests(root);
+  decoder_tests(); manifest_tests(); shipped_manifest_tests(); applier_tests(root); data_dir_tests(root);
   std::cout << "Sys generation: decoder, manifest, verification, atomic output and redirects passed\n";
 }
